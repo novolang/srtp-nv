@@ -1,0 +1,176 @@
+// srtpmac.nv — HMAC-SHA1 over the bytes of a packet buffer, one byte at a time.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.  The SRTP
+// authentication function of RFC 3711 section 4.2.1 is HMAC-SHA1 (RFC 2104)
+// under a 160-bit session key, with the output cut to the leftmost 32 or 80
+// bits.  The compression function is the one of crypto-nv, a state and a
+// function that take no `Bytes`; the padding and the two passes of the HMAC
+// are written here over a 64-byte block held in a `@value` struct, so a tag
+// is computed with the heap untouched.
+//
+// The key is always 20 bytes, which is shorter than the 64-byte block, so
+// the key block is the key followed by zeros and no key is hashed first.
+
+use word
+use sha1_core
+use rtpbytes
+
+// The session authentication key of SRTP and SRTCP: 160 bits.
+pub alias SrtpAuthKey = Vec[u8; 20]
+
+// A SHA-1 digest or an HMAC-SHA1 tag: 20 bytes.
+pub alias SrtpDigest = Vec[u8; 20]
+
+// The length of the key, in bytes: 20.
+pub const SRTP_AUTH_KEY_BYTES = 20
+
+// A SHA-1 computation being fed one byte at a time: the chaining state, the
+// block being filled and the number of bytes fed.
+pub @value
+struct SrtpSha1
+    // The five chaining words and the length that crypto-nv keeps.
+    s: Sha1
+    // The block being filled.
+    buf: Vec[u8; 64]
+    // The number of bytes fed, including the key block of an HMAC.
+    total: Int
+
+// A SHA-1 computation with nothing fed: the initial value of FIPS 180-4
+// section 5.3.1.
+@tier(embedded)
+@no_alloc
+fn sha_new() -> SrtpSha1 []
+    SrtpSha1 { s: Sha1 { h0: 0x67452301, h1: 0xEFCDAB89, h2: 0x98BADCFE, h3: 0x10325476,
+                         h4: 0xC3D2E1F0, len: 0 },
+               buf: Vec.new(), total: 0 }
+
+// The big-endian word at index `i` of the block being held.
+@tier(embedded)
+@no_alloc
+fn word_at(var buf: Vec[u8; 64], i: Int) -> Int []
+    (buf[4 * i] as Int << 24) | (buf[4 * i + 1] as Int << 16) | (buf[4 * i + 2] as Int << 8)
+        | buf[4 * i + 3] as Int
+
+// The sixteen words of the block being held.
+@tier(embedded)
+@no_alloc
+fn block_of(var buf: Vec[u8; 64]) -> Block []
+    Block { w: [word_at(var buf, 0), word_at(var buf, 1), word_at(var buf, 2),
+                word_at(var buf, 3), word_at(var buf, 4), word_at(var buf, 5),
+                word_at(var buf, 6), word_at(var buf, 7), word_at(var buf, 8),
+                word_at(var buf, 9), word_at(var buf, 10), word_at(var buf, 11),
+                word_at(var buf, 12), word_at(var buf, 13), word_at(var buf, 14),
+                word_at(var buf, 15)] }
+
+// Feed one byte.
+@tier(embedded)
+@no_alloc
+fn sha_byte(var h: SrtpSha1, v: Int) []
+    let _ = h.buf.push((v & 0xFF) as u8)
+    h.total = h.total + 1
+    if h.buf.len() == 64
+        h.s = sha1_core.compress(h.s, block_of(var h.buf))
+        h.buf.clear()
+
+// Write the four bytes of a word to a digest, the highest first.
+@tier(embedded)
+@no_alloc
+fn put_word(var out: SrtpDigest, w: Int) []
+    for i in 0..4
+        let _ = out.push(((w >>> (8 * (3 - i))) & 0xFF) as u8)
+
+// Pad, finish and write the digest to `out`, replacing what it held.
+@tier(embedded)
+@no_alloc
+fn sha_finish(var h: SrtpSha1, var out: SrtpDigest) []
+    let nbits = h.total * 8
+    sha_byte(var h, 0x80)
+    for _i in 0..64
+        if h.buf.len() != 56
+            sha_byte(var h, 0)
+    for i in 0..8
+        sha_byte(var h, nbits >>> (8 * (7 - i)))
+    out.clear()
+    put_word(var out, h.s.h0)
+    put_word(var out, h.s.h1)
+    put_word(var out, h.s.h2)
+    put_word(var out, h.s.h3)
+    put_word(var out, h.s.h4)
+
+// An HMAC-SHA1 under `key`, with the inner pad already fed.
+//
+// ```novo
+// use srtpmac
+//
+// fn main() [io]
+//     var key: srtpmac.SrtpAuthKey = Vec.new()
+//     for _i in 0..20
+//         let _ = key.push(0x0b as u8)
+//     var m = srtpmac.hmac_new(var key)
+//     srtpmac.hmac_byte(var m, 72)
+//     srtpmac.hmac_byte(var m, 105)
+//     var tag: srtpmac.SrtpDigest = Vec.new()
+//     srtpmac.hmac_finish(var m, var key, var tag)
+//     println("${tag[0]} ${tag[19]}")   // 182 0
+// ```
+pub @tier(embedded)
+@no_alloc
+fn hmac_new(var key: SrtpAuthKey) -> SrtpSha1 []
+    var inner = sha_new()
+    for i in 0..64
+        if i < key.len()
+            sha_byte(var inner, key[i] as Int ^ 0x36)
+        else
+            sha_byte(var inner, 0x36)
+    inner
+
+// Feed one byte of the message.
+pub @tier(embedded)
+@no_alloc
+fn hmac_byte(var m: SrtpSha1, v: Int) []
+    sha_byte(var m, v)
+
+// Feed `n` bytes of a packet from index `off`.  A range that is not inside
+// the packet feeds only the bytes that are.
+pub @tier(embedded)
+@no_alloc
+fn hmac_range(var m: SrtpSha1, var pkt: rtpbytes.RtpBuf, off: Int, n: Int) []
+    for i in 0..n
+        if off + i >= 0 and off + i < pkt.len()
+            sha_byte(var m, pkt[off + i] as Int)
+
+// Feed the four bytes of a 32-bit value, the highest first.
+pub @tier(embedded)
+@no_alloc
+fn hmac_u32(var m: SrtpSha1, v: Int) []
+    for i in 0..4
+        sha_byte(var m, v >>> (8 * (3 - i)))
+
+// Finish the HMAC and write its 20 bytes to `out`, replacing what it held.
+pub @tier(embedded)
+@no_alloc
+fn hmac_finish(var m: SrtpSha1, var key: SrtpAuthKey, var out: SrtpDigest) []
+    var inner_digest: SrtpDigest = Vec.new()
+    sha_finish(var m, var inner_digest)
+    var outer = sha_new()
+    for i in 0..64
+        if i < key.len()
+            sha_byte(var outer, key[i] as Int ^ 0x5C)
+        else
+            sha_byte(var outer, 0x5C)
+    for i in 0..20
+        sha_byte(var outer, inner_digest[i] as Int)
+    sha_finish(var outer, var out)
+
+// Whether the first `n` bytes of a tag equal `n` bytes of a packet from
+// index `off`.  Every byte is compared before the answer, so the time does
+// not say where the first difference is.
+pub @tier(embedded)
+@no_alloc
+fn tag_equals(var tag: SrtpDigest, var pkt: rtpbytes.RtpBuf, off: Int, n: Int) -> Bool []
+    if n < 0 or n > 20 or off < 0 or off + n > pkt.len()
+        return false
+    var diff = 0
+    for i in 0..n
+        diff = diff | (tag[i] as Int ^ pkt[off + i] as Int)
+    diff == 0

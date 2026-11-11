@@ -1,0 +1,27 @@
+[package]
+name        = "srtp-nv"
+version     = "0.1.0"
+description = "SRTP and SRTCP for novo-lang, RFC 3711 with the AES-GCM profiles of RFC 7714: the master key and salt and the key derivation of AES-CM, the packet index and the roll-over counter, AES-128 and AES-256 counter mode, HMAC-SHA1 tags of 80 and 32 bits, the replay window of 64, the master key identifier, SRTCP with its index and E bit, keys taken from the exporter bytes of DTLS-SRTP (RFC 5764), and the SDES crypto attribute of RFC 4568. Over buffers the caller owns, with no allocation and no sockets."
+license     = "Apache-2.0"
+stability   = "experimental"
+category    = "networking"
+layer       = "core"
+tags        = ["srtp", "srtcp", "rfc3711", "rfc7714", "rfc4568", "rfc5764", "aes", "aes-gcm", "hmac", "webrtc", "rtp", "embedded", "sans-io", "no-alloc"]
+repository  = "https://github.com/novolang/srtp-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.24.1"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "Protecting RTP and RTCP with SRTP, as steps the caller drives"
+
+[dependencies]
+# rtp-nv holds the packet buffer and the big-endian reads and writes that
+# an RTP header is made of.  crypto-nv holds the AES block cipher, the
+# GHASH multiplication and the SHA-1 compression function, each as a state
+# and a function that take no `Bytes`; the counter mode, the GCM mode, the
+# HMAC and the key derivation are written here over buffers the caller owns.
+rtp-nv    = "^0.1.0"
+crypto-nv = "^0.1.8"

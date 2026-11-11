@@ -1,0 +1,220 @@
+// srtpkdf_tests.nv — AES counter mode and the key derivation function,
+// against the vectors of RFC 3711 appendix B.
+//
+// THE VECTORS ARE PUBLISHED, NOT RECORDED FROM THIS CODE.  Appendix B.2 is
+// the keystream of the session key 2B7E1516... under the counter
+// F0F1F2F3...FD0000, whose first three and last three blocks the RFC
+// prints.  Appendix B.3 derives the cipher key, the cipher salt and the
+// authentication key from the master key E1F97A0D... and the master salt
+// 0EC675AD...; the RFC prints 94 bytes of the authentication key and this
+// package derives the 20 an HMAC-SHA1 key needs, so the first 20 bytes and
+// the second block of the printed 94 are compared.
+//
+// The AES-256 derivation of RFC 6188 has no vector in the RFC.  Its test
+// compares the derived keys with a computation by the `cryptography`
+// library of Python, shown in the test's comment.
+
+use std.str
+use std.test
+use aes_core
+use rtpbytes
+use srtpaes
+use srtpkdf
+
+// The value of a hexadecimal digit, or -1.
+fn hexval(c: Int) -> Int
+    if c >= 48 and c <= 57
+        return c - 48
+    if c >= 97 and c <= 102
+        return c - 87
+    if c >= 65 and c <= 70
+        return c - 55
+    -1
+
+// Bytes from a hexadecimal dump; anything that is not a digit is a separator.
+fn bytes_hex(s: Str) -> srtpaes.SrtpBytes
+    var m: srtpaes.SrtpBytes = Vec.new()
+    var hi = -1
+    for i in 0..str.len(s)
+        let v = hexval(str.byte_at_or(s, i, 0))
+        if v >= 0
+            if hi < 0
+                hi = v
+            else
+                let _ = m.push((hi * 16 + v) as u8)
+                hi = -1
+    m
+
+fn digit(v: Int) -> Int
+    if v < 10
+        return 48 + v
+    55 + v
+
+// The upper-case hexadecimal of bytes.
+fn hex_of(var d: srtpaes.SrtpBytes) -> Str
+    var s = ""
+    for i in 0..d.len()
+        let b = d[i] as Int
+        s = s + str.from_byte(digit(b >> 4)) + str.from_byte(digit(b & 15))
+    s
+
+// A block from a 32-digit dump.
+fn block_hex(s: Str) -> aes_core.AesBlock
+    var b = bytes_hex(s)
+    srtpaes.block_at(var b, 0)
+
+// The block as upper-case hexadecimal.
+fn block_str(b: aes_core.AesBlock) -> Str
+    var d: srtpaes.SrtpBytes = Vec.new()
+    for i in 0..16
+        let _ = d.push(srtpaes.block_byte(b, i) as u8)
+    hex_of(var d)
+
+@test
+fn test_rfc3711_b2_the_keystream_of_the_session_key() [io]
+    var key = bytes_hex("2B7E151628AED2A6ABF7158809CF4F3C")
+    let k = srtpaes.expand(var key, 16)
+    let iv = block_hex("F0F1F2F3F4F5F6F7F8F9FAFBFCFD0000")
+    test.case("the first block of the keystream segment")
+    test.assert_eq(block_str(aes_core.encrypt_block(k, srtpaes.counter_block(iv, 0))),
+        "E03EAD0935C95E80E166B16DD92B4EB4")
+    test.case("the second and the third")
+    test.assert_eq(block_str(aes_core.encrypt_block(k, srtpaes.counter_block(iv, 1))),
+        "D23513162B02D0F72A43A2FE4A5F97AB")
+    test.assert_eq(block_str(aes_core.encrypt_block(k, srtpaes.counter_block(iv, 2))),
+        "41E95B3BB0A2E8DD477901E4FCA894C0")
+    test.case("the counters F0F1...FEFF, FF00 and FF01 carry from the low byte into the next")
+    test.assert_eq(block_str(aes_core.encrypt_block(k, srtpaes.counter_block(iv, 0xFEFF))),
+        "EC8CDF7398607CB0F2D21675EA9EA1E4")
+    test.assert_eq(block_str(aes_core.encrypt_block(k, srtpaes.counter_block(iv, 0xFF00))),
+        "362B7C3C6773516318A077D7FC5073AE")
+    test.assert_eq(block_str(aes_core.encrypt_block(k, srtpaes.counter_block(iv, 0xFF01))),
+        "6A2CC3787889374FBEB4C81B17BA6C44")
+
+@test
+fn test_ctr_xor_encrypts_and_decrypts_over_a_packet() [io]
+    var key = bytes_hex("2B7E151628AED2A6ABF7158809CF4F3C")
+    let k = srtpaes.expand(var key, 16)
+    let iv = block_hex("F0F1F2F3F4F5F6F7F8F9FAFBFCFD0000")
+    test.case("zero bytes become the keystream of appendix B.2, in three blocks")
+    var p: rtpbytes.RtpBuf = Vec.new()
+    for _i in 0..40
+        let _ = p.push(0 as u8)
+    srtpaes.ctr_xor(k, iv, var p, 0, 40)
+    var got: srtpaes.SrtpBytes = Vec.new()
+    for i in 0..32
+        let _ = got.push(p[i])
+    test.assert_eq(hex_of(var got), "E03EAD0935C95E80E166B16DD92B4EB4D23513162B02D0F72A43A2FE4A5F97AB")
+    test.assert_eq(p[32] as Int, 0x41)
+    test.assert_eq(p[39] as Int, 0xDD)
+    test.case("the same call undoes itself")
+    srtpaes.ctr_xor(k, iv, var p, 0, 40)
+    test.assert_eq(p[0] as Int, 0)
+    test.assert_eq(p[39] as Int, 0)
+    test.case("a range starting inside the packet leaves the bytes before it")
+    p[0] = 7 as u8
+    srtpaes.ctr_xor(k, iv, var p, 1, 2)
+    test.assert_eq(p[0] as Int, 7)
+    test.assert_eq(p[1] as Int, 0xE0)
+    test.assert_eq(p[2] as Int, 0x3E)
+    test.assert_eq(p[3] as Int, 0)
+    test.case("a range that runs past the end changes only the bytes that are there")
+    var short: rtpbytes.RtpBuf = Vec.new()
+    let _ = short.push(0 as u8)
+    let _ = short.push(0 as u8)
+    srtpaes.ctr_xor(k, iv, var short, 1, 5)
+    test.assert_eq(short.len(), 2)
+    test.assert_eq(short[0] as Int, 0)
+    test.assert_eq(short[1] as Int, 0xE0)
+    test.case("a range that starts before the packet skips the byte it cannot name and keeps the keystream in step")
+    srtpaes.ctr_xor(k, iv, var short, -1, 2)
+    test.assert_eq(short[0] as Int, 0x3E)
+
+@test
+fn test_rfc3711_b3_the_session_keys_of_the_default_profile() [io]
+    var mk = bytes_hex("E1F97A0D3E018BE0D64FA32C06DE4139")
+    var salt = bytes_hex("0EC675AD498AFEEBB6960B3AABE6")
+    let k = srtpaes.expand(var mk, 16)
+    var out: srtpaes.SrtpBytes = Vec.new()
+    test.case("the cipher key, label 0 and index DIV kdr of zero")
+    srtpkdf.derive(k, var salt, srtpkdf.SRTP_LABEL_RTP_ENC, 0, 16, var out)
+    test.assert_eq(hex_of(var out), "C61E7A93744F39EE10734AFE3FF7A087")
+    test.case("the cipher salt, label 2: the first 14 bytes of the block the RFC prints")
+    srtpkdf.derive(k, var salt, srtpkdf.SRTP_LABEL_RTP_SALT, 0, 14, var out)
+    test.assert_eq(hex_of(var out), "30CBBC08863D8C85D49DB34A9AE1")
+    test.case("the auth key, label 1: the first 20 bytes of the 94 the RFC prints")
+    srtpkdf.derive(k, var salt, srtpkdf.SRTP_LABEL_RTP_AUTH, 0, 20, var out)
+    test.assert_eq(hex_of(var out), "CEBE321F6FF7716B6FD4AB49AF256A156D38BAA4")
+    test.case("the second block of the auth key is the keystream block numbered 1")
+    srtpkdf.derive(k, var salt, srtpkdf.SRTP_LABEL_RTP_AUTH, 0, 32, var out)
+    test.assert_eq(str.slice(hex_of(var out), 32, 64), "6D38BAA48F0A0ACF3C34E2359E6CDBCE")
+    test.case("the SRTCP labels give other keys from the same master")
+    srtpkdf.derive(k, var salt, srtpkdf.SRTP_LABEL_RTCP_ENC, 0, 16, var out)
+    test.assert(hex_of(var out) != "C61E7A93744F39EE10734AFE3FF7A087")
+    test.assert_eq(out.len(), 16)
+
+@test
+fn test_the_input_block_puts_the_label_and_the_index_in_place() [io]
+    test.case("the label is XORed into byte 7 and index DIV kdr into bytes 8 to 13")
+    var salt = bytes_hex("00000000000000000000000000")
+    let b = srtpkdf.input_block(var salt, 5, 0x0102030405FF)
+    test.assert_eq(block_str(b), "00000000000000050102030405FF0000")
+    test.case("a 12-byte salt is the first 12 bytes of a salt that ends in two zero bytes")
+    var s12 = bytes_hex("0102030405060708090A0B0C")
+    let c = srtpkdf.input_block(var s12, 0, 0)
+    test.assert_eq(block_str(c), "0102030405060708090A0B0C00000000")
+    test.case("a salt over 14 bytes is cut to its first 14")
+    var long = bytes_hex("0102030405060708090A0B0C0D0E0F10")
+    let d = srtpkdf.input_block(var long, 0, 0)
+    test.assert_eq(block_str(d), "0102030405060708090A0B0C0D0E0000")
+
+@test
+fn test_aes_256_derivation_follows_rfc_6188() [io]
+    // Computed with Python's cryptography library, an independent AES:
+    //   from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    //   mk = bytes(range(32)); salt = bytes(range(0xA0, 0xAE))
+    //   x = bytearray(16); x[0:14] = salt; x[7] ^= 0           # label 0, index 0
+    //   Cipher(algorithms.AES(mk), modes.CTR(bytes(x))).encryptor().update(bytes(32)).hex()
+    var mk = bytes_hex("000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F")
+    var salt = bytes_hex("A0A1A2A3A4A5A6A7A8A9AAABACAD")
+    let k = srtpaes.expand(var mk, 32)
+    test.assert_eq(k.rounds, 14)
+    var out: srtpaes.SrtpBytes = Vec.new()
+    srtpkdf.derive(k, var salt, srtpkdf.SRTP_LABEL_RTP_ENC, 0, 32, var out)
+    test.assert_eq(hex_of(var out), "8FF338062F0014AD7018CEDA7AD30D784B582FAA338D95C29F02AAB161A7F31F")
+
+@test
+fn test_rfc6188_7_1_the_aes_256_keystream() [io]
+    var key = bytes_hex("57f82fe3613fd170a85ec93c40b1f0922ec4cb0dc025b58272147cc438944a98")
+    let k = srtpaes.expand(var key, 32)
+    let iv = block_hex("f0f1f2f3f4f5f6f7f8f9fafbfcfd0000")
+    test.case("the first three blocks")
+    test.assert_eq(block_str(aes_core.encrypt_block(k, srtpaes.counter_block(iv, 0))),
+        "92BDD28A93C3F52511C677D08B5515A4")
+    test.assert_eq(block_str(aes_core.encrypt_block(k, srtpaes.counter_block(iv, 1))),
+        "9DA71B2378A854F67050756DED165BAC")
+    test.assert_eq(block_str(aes_core.encrypt_block(k, srtpaes.counter_block(iv, 2))),
+        "63C4868B7096D88421B563B8C94C9A31")
+    test.case("the blocks at the counters feff, ff00 and ff01")
+    test.assert_eq(block_str(aes_core.encrypt_block(k, srtpaes.counter_block(iv, 0xFEFF))),
+        "CEA518C90FD91CED9CBB18C078A54711")
+    test.assert_eq(block_str(aes_core.encrypt_block(k, srtpaes.counter_block(iv, 0xFF00))),
+        "3DBC4814F4DA5F00A08772B63C6A046D")
+    test.assert_eq(block_str(aes_core.encrypt_block(k, srtpaes.counter_block(iv, 0xFF01))),
+        "6EB246913062A16891433E97DD01A57F")
+
+@test
+fn test_rfc6188_7_2_the_aes_256_session_keys() [io]
+    var mk = bytes_hex("f0f04914b513f2763a1b1fa130f10e2998f6f6e43e4309d1e622a0e332b9f1b6")
+    var salt = bytes_hex("3b04803de51ee7c96423ab5b78d2")
+    let k = srtpaes.expand(var mk, 32)
+    var out: srtpaes.SrtpBytes = Vec.new()
+    test.case("the cipher key is two blocks of the keystream")
+    srtpkdf.derive(k, var salt, srtpkdf.SRTP_LABEL_RTP_ENC, 0, 32, var out)
+    test.assert_eq(hex_of(var out), "5BA1064E30EC51613CAD926C5A28EF731EC7FB397F70A960653CAF06554CD8C4")
+    test.case("the cipher salt is the first 14 bytes of one block")
+    srtpkdf.derive(k, var salt, srtpkdf.SRTP_LABEL_RTP_SALT, 0, 14, var out)
+    test.assert_eq(hex_of(var out), "FA31791685CA444A9E07C6C64E93")
+    test.case("the auth key is a block and four bytes of the next")
+    srtpkdf.derive(k, var salt, srtpkdf.SRTP_LABEL_RTP_AUTH, 0, 20, var out)
+    test.assert_eq(hex_of(var out), "FD9C32D39ED5FBB5A9DC96B30818454D1313DC05")

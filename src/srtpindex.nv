@@ -1,0 +1,138 @@
+// srtpindex.nv — the packet index, the roll-over counter and the replay
+// window of SRTP and SRTCP, as integer arithmetic.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.
+//
+// THE INDEX OF AN SRTP PACKET is a 48-bit number, `2^16 * ROC + SEQ`
+// (RFC 3711 section 3.3.1).  The packet carries only the 16-bit sequence
+// number SEQ.  The roll-over counter ROC counts how many times the sequence
+// number has passed 65535, and each end keeps it.  A receiver that has
+// authenticated a packet with the highest index `top` guesses the ROC of the
+// next packet from SEQ: the sequence numbers are taken to be within 2^15 of
+// the highest one, so a SEQ far below it is a packet of the next cycle and a
+// SEQ far above it, seen while the highest is small, is one of the last.
+//
+// THE REPLAY LIST of section 3.3.2 is a window of 64 indexes that ends at
+// `top`.  A bit of `mask` says whether an index has been received: bit 0 is
+// `top` itself, bit `k` is `top - k`.  An index above `top` is new; one
+// inside the window is new when its bit is clear; one below the window is
+// refused, because the receiver can no longer tell.  The window moves only
+// when a packet has been authenticated, so a forged packet cannot slide it.
+//
+// SRTCP has the same window over a 31-bit index that its packets carry, so
+// the functions here take the width of the index in bits.
+
+// The number of indexes the replay window remembers: 64.
+pub const SRTP_REPLAY_WINDOW = 64
+
+// The width of an SRTP index, in bits: 48.
+pub const SRTP_INDEX_BITS = 48
+
+// The width of an SRTCP index, in bits: 31.
+pub const SRTCP_INDEX_BITS = 31
+
+// The highest index and the indexes received below it.
+pub @value
+struct SrtpWindow
+    // Whether a packet has been accepted yet.
+    started: Bool
+    // The highest accepted index.
+    top: Int
+    // Bit `k` is set when `top - k` was accepted; bit 0 is `top`.
+    mask: Int
+
+// A window with nothing accepted.
+pub @tier(embedded)
+@no_alloc
+fn window_new() -> SrtpWindow []
+    SrtpWindow { started: false, top: 0, mask: 0 }
+
+// The index to try for a packet with the sequence number `seq`, by the
+// estimate of RFC 3711 section 3.3.1.
+//
+// With nothing accepted the ROC is 0.  Otherwise let `s_l` be the low 16
+// bits of the highest index and `roc` the rest: when `s_l` is under 2^15 a
+// SEQ more than 2^15 above it belongs to the cycle before, and when `s_l` is
+// 2^15 or over a SEQ more than 2^15 below it belongs to the next one.  The
+// ROC is reduced modulo 2^32.
+//
+// ```novo
+// use srtpindex
+//
+// fn main() [io]
+//     var w = srtpindex.window_new()
+//     srtpindex.accept(var w, 65535, 48)
+//     println("${srtpindex.estimate(w, 0)}")   // 65536
+// ```
+pub @tier(embedded)
+@no_alloc
+fn estimate(w: SrtpWindow, seq: Int) -> Int []
+    if not w.started
+        return seq
+    let s_l = w.top & 0xFFFF
+    let roc = w.top >>> 16
+    var v = roc
+    if s_l < 32768
+        if seq - s_l > 32768
+            v = (roc - 1) & 0xFFFFFFFF
+    else if s_l - 32768 > seq
+        v = (roc + 1) & 0xFFFFFFFF
+    (v << 16) | seq
+
+// The signed distance of an index from the highest one, in a space of
+// `bits` bits: positive when the index is above, zero or negative when it is
+// the highest or below.
+@tier(embedded)
+@no_alloc
+fn distance(w: SrtpWindow, index: Int, bits: Int) -> Int []
+    let space = 1 << bits
+    let d = (index - w.top) & (space - 1)
+    if d >= (space >> 1)
+        return d - space
+    d
+
+// Whether a packet with this index may be accepted: it is new, or it is
+// inside the window and not yet received.  An index below the window is
+// refused.
+//
+// ```novo
+// use srtpindex
+//
+// fn main() [io]
+//     var w = srtpindex.window_new()
+//     srtpindex.accept(var w, 100, 48)
+//     println("${srtpindex.fresh(w, 100, 48)} ${srtpindex.fresh(w, 99, 48)} ${srtpindex.fresh(w, 36, 48)}")   // false true false
+// ```
+pub @tier(embedded)
+@no_alloc
+fn fresh(w: SrtpWindow, index: Int, bits: Int) -> Bool []
+    if not w.started
+        return true
+    let d = distance(w, index, bits)
+    if d > 0
+        return true
+    let back = 0 - d
+    if back >= SRTP_REPLAY_WINDOW
+        return false
+    ((w.mask >>> back) & 1) == 0
+
+// Record an index whose packet has been authenticated: move the window when
+// the index is above the highest, or mark it when it is inside.  An index
+// that is not `fresh` leaves the window as it was.
+pub @tier(embedded)
+@no_alloc
+fn accept(var w: SrtpWindow, index: Int, bits: Int) []
+    if not w.started
+        w.started = true
+        w.top = index
+        w.mask = 1
+        return
+    let d = distance(w, index, bits)
+    if d > 0
+        if d >= SRTP_REPLAY_WINDOW
+            w.mask = 1
+        else
+            w.mask = (w.mask << d) | 1
+        w.top = index
+    else if fresh(w, index, bits)
+        w.mask = w.mask | (1 << (0 - d))

@@ -1,0 +1,218 @@
+// srtpgcm.nv — AES-GCM over a packet buffer, for the profiles of RFC 7714.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.  AES-GCM
+// (NIST SP 800-38D) encrypts with AES in counter mode and authenticates the
+// ciphertext and some additional data with GHASH.  The block cipher and the
+// multiplication in GF(2^128) are those of crypto-nv; the mode is written
+// here, over a packet held in a buffer, because crypto-nv's own front end
+// takes and answers `Bytes`, which is a heap value.
+//
+// WHAT SRTP AUTHENTICATES.  RFC 7714 sections 8 and 9 split a packet into
+// the additional data, which is authenticated and sent in the clear, and
+// the plaintext, which is both.  For an RTP packet the additional data is
+// the header, with its CSRC list and its extension, and the plaintext is
+// everything after it.  For an RTCP packet the additional data is the first
+// eight bytes and the 32-bit word of the E bit and the SRTCP index, which
+// the packet carries after the cipher, and the plaintext is the rest; a
+// packet that is not encrypted has no plaintext and the whole of it is
+// additional data.
+//
+// So the additional data here is a range of the buffer that starts at index
+// 0, an optional 32-bit word that follows it in the hash, and the plaintext
+// starts where the range ends.
+//
+// THE 12-BYTE IV is formed by the caller (RFC 7714 section 8.1 and 9.1) and
+// is the pre-counter block with the counter 1.  The keystream blocks start
+// at the counter 2, and the tag is the GHASH XORed with the encryption of
+// the pre-counter block.  The tag is 16 bytes and follows the cipher.
+
+use aes_core
+use ghash_core
+use word
+use rtpbytes
+use srtpaes
+
+// The length of the tag, in bytes: 16.
+pub const SRTP_GCM_TAG = 16
+
+// The length of the IV, in bytes: 12.
+pub const SRTP_GCM_IV = 12
+
+// A GCM key: the expanded AES key and the hash subkey, the encryption of
+// the zero block.
+pub @value
+struct SrtpGcmKey
+    // The expanded AES key.
+    k: aes_core.AesKey
+    // The hash subkey H of NIST SP 800-38D section 6.4.
+    h: ghash_core.Gf128
+
+// The GHASH being computed: the running value and the block being filled.
+@value
+struct GcmHash
+    // The running value Y.
+    y: ghash_core.Gf128
+    // Up to 16 bytes not yet absorbed.
+    blk: Vec[u8; 16]
+
+// A GCM key from 16 or 32 bytes of key.
+//
+// ```novo
+// use srtpaes
+// use srtpgcm
+//
+// fn main() [io]
+//     var k: srtpaes.SrtpBytes = Vec.new()
+//     for i in 0..16
+//         let _ = k.push(i as u8)
+//     let g = srtpgcm.key(var k, 16)
+//     println("${g.k.rounds}")   // 10
+// ```
+pub @tier(embedded)
+@no_alloc
+fn key(var raw: srtpaes.SrtpBytes, n: Int) -> SrtpGcmKey []
+    let k = srtpaes.expand(var raw, n)
+    let e = aes_core.encrypt_block(k, aes_core.AesBlock { lo: 0, hi: 0 })
+    SrtpGcmKey { k: k, h: ghash_core.Gf128 { hi: word.bswap64(e.lo), lo: word.bswap64(e.hi) } }
+
+// A fresh GHASH.
+@tier(embedded)
+@no_alloc
+fn gh_new() -> GcmHash []
+    GcmHash { y: ghash_core.Gf128 { hi: 0, lo: 0 }, blk: Vec.new() }
+
+// Eight bytes of the held block from index `at`, the first byte highest.
+@tier(embedded)
+@no_alloc
+fn be64(var blk: Vec[u8; 16], at: Int) -> Int []
+    var v = 0
+    for i in 0..8
+        v = (v << 8) | blk[at + i] as Int
+    v
+
+// Absorb the full block and empty it.
+@tier(embedded)
+@no_alloc
+fn gh_absorb(var g: GcmHash, h: ghash_core.Gf128) []
+    g.y = ghash_core.absorb(g.y, h, ghash_core.Gf128 { hi: be64(var g.blk, 0), lo: be64(var g.blk, 8) })
+    g.blk.clear()
+
+// Feed one byte.
+@tier(embedded)
+@no_alloc
+fn gh_byte(var g: GcmHash, h: ghash_core.Gf128, v: Int) []
+    let _ = g.blk.push((v & 0xFF) as u8)
+    if g.blk.len() == 16
+        gh_absorb(var g, h)
+
+// Pad the block being held with zero bytes and absorb it, if it holds any.
+@tier(embedded)
+@no_alloc
+fn gh_pad(var g: GcmHash, h: ghash_core.Gf128) []
+    if g.blk.len() > 0
+        for _i in 0..16
+            if g.blk.len() < 16
+                let _ = g.blk.push(0 as u8)
+        gh_absorb(var g, h)
+
+// Feed `n` bytes of a packet from index `off`.
+@tier(embedded)
+@no_alloc
+fn gh_range(var g: GcmHash, h: ghash_core.Gf128, var pkt: rtpbytes.RtpBuf, off: Int, n: Int) []
+    for i in 0..n
+        gh_byte(var g, h, pkt[off + i] as Int)
+
+// The pre-counter block J0 for a 12-byte IV: the IV and the counter 1.
+@tier(embedded)
+@no_alloc
+fn j0_of(var iv: srtpaes.SrtpBytes) -> aes_core.AesBlock []
+    aes_core.AesBlock { lo: srtpaes.le64(var iv, 0), hi: srtpaes.le64(var iv, 8) | (1 << 56) }
+
+// The counter block with its last four bytes, a big-endian counter, set to
+// `c`.
+@tier(embedded)
+@no_alloc
+fn with_counter(j0: aes_core.AesBlock, c: Int) -> aes_core.AesBlock []
+    aes_core.AesBlock { lo: j0.lo, hi: (j0.hi & 0xFFFFFFFF) | (word.bswap32(c & 0xFFFFFFFF) << 32) }
+
+// XOR the keystream of the counters 2, 3, ... with `n` bytes of a packet
+// from index `off`.
+@tier(embedded)
+@no_alloc
+fn gcm_ctr(k: aes_core.AesKey, j0: aes_core.AesBlock, var pkt: rtpbytes.RtpBuf, off: Int, n: Int) []
+    let blocks = (n + 15) / 16
+    for j in 0..blocks
+        let ks = aes_core.encrypt_block(k, with_counter(j0, 2 + j))
+        for i in 0..16
+            if 16 * j + i < n
+                let at = off + 16 * j + i
+                pkt[at] = (pkt[at] as Int ^ srtpaes.block_byte(ks, i)) as u8
+
+// The tag over the additional data (the packet's first `aad_len` bytes and,
+// when `has_word`, the 32-bit `word`) and the `ct_len` bytes of cipher that
+// follow them.
+@tier(embedded)
+@no_alloc
+fn gcm_tag(var gk: SrtpGcmKey, j0: aes_core.AesBlock, var pkt: rtpbytes.RtpBuf, aad_len: Int,
+           has_word: Bool, word_value: Int, ct_len: Int) -> aes_core.AesBlock []
+    let h = gk.h
+    var g = gh_new()
+    gh_range(var g, h, var pkt, 0, aad_len)
+    var aad_total = aad_len
+    if has_word
+        for i in 0..4
+            gh_byte(var g, h, word_value >>> (8 * (3 - i)))
+        aad_total = aad_total + 4
+    gh_pad(var g, h)
+    gh_range(var g, h, var pkt, aad_len, ct_len)
+    gh_pad(var g, h)
+    let s = ghash_core.absorb(g.y, h, ghash_core.Gf128 { hi: aad_total * 8, lo: ct_len * 8 })
+    let e = aes_core.encrypt_block(gk.k, j0)
+    aes_core.AesBlock { lo: e.lo ^ word.bswap64(s.hi), hi: e.hi ^ word.bswap64(s.lo) }
+
+// Encrypt the `n` bytes of a packet that follow its first `aad_len` bytes
+// and append the 16-byte tag.
+//
+// `iv` is the 12-byte IV, `has_word` says whether the 32-bit `word_value`
+// belongs to the additional data after the range, as the E bit and index of
+// SRTCP do.  Answers false, changing nothing, when the range is not inside
+// the packet or the tag does not fit in the buffer.
+pub @tier(embedded)
+@no_alloc
+fn seal(var gk: SrtpGcmKey, var iv: srtpaes.SrtpBytes, var pkt: rtpbytes.RtpBuf, aad_len: Int,
+        has_word: Bool, word_value: Int, n: Int) -> Bool []
+    if aad_len < 0 or n < 0 or aad_len + n > pkt.len() or pkt.len() + SRTP_GCM_TAG > rtpbytes.RTP_BUF_MAX
+        return false
+    let j0 = j0_of(var iv)
+    gcm_ctr(gk.k, j0, var pkt, aad_len, n)
+    let t = gcm_tag(var gk, j0, var pkt, aad_len, has_word, word_value, n)
+    for i in 0..SRTP_GCM_TAG
+        let _ = pkt.push(srtpaes.block_byte(t, i) as u8)
+    true
+
+// Check the tag that ends the `n + 16` bytes that follow the first
+// `aad_len` bytes of a packet, then decrypt the `n` bytes and remove the
+// tag from the end of the packet.
+//
+// The tag is compared over all 16 bytes before the answer, and nothing is
+// decrypted when it does not match.  Answers false, changing nothing, when
+// the range is not inside the packet or the tag is wrong.  The tag must be
+// the last 16 bytes of the packet: a caller with a word or a key identifier
+// after it removes those first.
+pub @tier(embedded)
+@no_alloc
+fn open(var gk: SrtpGcmKey, var iv: srtpaes.SrtpBytes, var pkt: rtpbytes.RtpBuf, aad_len: Int,
+        has_word: Bool, word_value: Int, n: Int) -> Bool []
+    if aad_len < 0 or n < 0 or aad_len + n + SRTP_GCM_TAG != pkt.len()
+        return false
+    let j0 = j0_of(var iv)
+    let t = gcm_tag(var gk, j0, var pkt, aad_len, has_word, word_value, n)
+    var diff = 0
+    for i in 0..SRTP_GCM_TAG
+        diff = diff | (srtpaes.block_byte(t, i) ^ pkt[aad_len + n + i] as Int)
+    if diff != 0
+        return false
+    gcm_ctr(gk.k, j0, var pkt, aad_len, n)
+    for _i in 0..SRTP_GCM_TAG
+        let _ = pkt.pop()
+    true

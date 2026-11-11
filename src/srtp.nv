@@ -1,0 +1,373 @@
+// srtp.nv — protecting and unprotecting an RTP or RTCP packet in place, the
+// packet forms of RFC 3711 sections 3.1 and 3.4 and RFC 7714.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it, and no allocation.  A
+// packet is a `Vec[u8; 1500]` that the caller owns.  `protect_rtp` turns an
+// RTP packet into an SRTP packet in that buffer and `unprotect_rtp` turns it
+// back; the RTCP pair does the same for a compound RTCP packet.  The caller
+// sends and receives the datagram and tells the context nothing else.
+//
+// THE SRTP PACKET, counter-mode profiles:
+//
+//     | RTP header | encrypted payload | MKI (optional) | tag (10 or 4 bytes) |
+//
+// The RTP header, with its CSRC list and its extension, stays in the clear.
+// The payload, with any RTP padding and the padding count, is XORed with the
+// keystream of the packet's index.  The tag is the HMAC-SHA1 of the header
+// and the encrypted payload followed by the 32-bit roll-over counter, cut to
+// its leftmost bytes.  The master key identifier is not authenticated.
+//
+// THE SRTP PACKET, AES-GCM profiles:
+//
+//     | RTP header | cipher | tag (16 bytes) | MKI (optional) |
+//
+// The header is the additional data of the AEAD, the payload is its
+// plaintext, and the 16-byte tag follows the cipher.
+//
+// THE SRTCP PACKET, counter-mode profiles:
+//
+//     | first 8 bytes | encrypted rest | E and index (4) | MKI | tag (10) |
+//
+// The first eight bytes of the compound packet, the header of the first
+// packet and the SSRC of the sender, stay in the clear.  The rest is
+// encrypted when the E bit is set.  The tag covers everything before the
+// MKI, the word of the E bit and the index included.  The GCM profiles put
+// the 16-byte tag after the cipher and the word after the tag.
+//
+// A packet that is refused is left as it was.
+
+use rtpbytes
+use srtpaes
+use srtpctx
+use srtpgcm
+use srtpindex
+use srtpmac
+
+// The highest SRTP index a master key may protect: 2^48 - 1.
+pub const SRTP_INDEX_MAX = 281474976710655
+
+// The highest SRTCP index a master key may protect: 2^31 - 1.
+pub const SRTCP_INDEX_MAX = 2147483647
+
+// The length of the header of an RTP packet in bytes, with its CSRC list
+// and its extension, or -1 when the bytes are not a header: fewer than 12,
+// a version other than 2, or a list or an extension that runs past the end.
+//
+// ```novo
+// use rtpbytes
+// use srtp
+//
+// fn main() [io]
+//     var p: rtpbytes.RtpBuf = Vec.new()
+//     for b in [0x80, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 7, 0xAA]
+//         let _ = p.push(b as u8)
+//     println("${srtp.header_len(var p)}")   // 12
+// ```
+pub @tier(embedded)
+@no_alloc
+fn header_len(var pkt: rtpbytes.RtpBuf) -> Int []
+    if pkt.len() < 12
+        return -1
+    let b0 = rtpbytes.get_u8(var pkt, 0)
+    if (b0 >> 6) != 2
+        return -1
+    var off = 12 + 4 * (b0 & 15)
+    if (b0 & 0x10) != 0
+        if off + 4 > pkt.len()
+            return -1
+        off = off + 4 + 4 * rtpbytes.get_u16(var pkt, off + 2)
+    if off > pkt.len()
+        return -1
+    off
+
+// Append the low `n` bytes of `v` to a packet, the highest first.
+@tier(embedded)
+@no_alloc
+fn put_be(var pkt: rtpbytes.RtpBuf, v: Int, n: Int) []
+    for i in 0..n
+        let _ = rtpbytes.put_u8(var pkt, v >>> (8 * (n - 1 - i)))
+
+// The `n` bytes of a packet from index `off`, as a big-endian number.
+@tier(embedded)
+@no_alloc
+fn get_be(var pkt: rtpbytes.RtpBuf, off: Int, n: Int) -> Int []
+    var v = 0
+    for i in 0..n
+        v = (v << 8) | rtpbytes.get_u8(var pkt, off + i)
+    v
+
+// Remove `n` bytes from the end of a packet.
+@tier(embedded)
+@no_alloc
+fn drop_tail(var pkt: rtpbytes.RtpBuf, n: Int) []
+    for _i in 0..n
+        let _ = pkt.pop()
+
+// The HMAC-SHA1 of the first `n` bytes of a packet, followed when
+// `with_roc` is true by the 32-bit roll-over counter `roc`, as SRTP does and
+// SRTCP does not.
+@tier(embedded)
+@no_alloc
+fn tag_of(var key: srtpmac.SrtpAuthKey, var pkt: rtpbytes.RtpBuf, n: Int, with_roc: Bool, roc: Int,
+          var out: srtpmac.SrtpDigest) []
+    var m = srtpmac.hmac_new(var key)
+    srtpmac.hmac_range(var m, var pkt, 0, n)
+    if with_roc
+        srtpmac.hmac_u32(var m, roc)
+    srtpmac.hmac_finish(var m, var key, var out)
+
+// Append the first `n` bytes of a tag to a packet.
+@tier(embedded)
+@no_alloc
+fn put_tag(var pkt: rtpbytes.RtpBuf, var tag: srtpmac.SrtpDigest, n: Int) []
+    for i in 0..n
+        let _ = rtpbytes.put_u8(var pkt, tag[i] as Int)
+
+// The bytes a packet gains in protection: the tag, 16 for AES-GCM and the
+// profile's for the counter mode, the master key identifier and, for SRTCP,
+// the word of the E bit and the index.
+@tier(embedded)
+@no_alloc
+fn overhead(var c: srtpctx.SrtpCtx, rtcp: Bool) -> Int []
+    var tag = srtpctx.rtp_tag_len(c.profile)
+    if rtcp
+        tag = srtpctx.rtcp_tag_len(c.profile)
+    if srtpctx.is_gcm(c.profile)
+        tag = srtpgcm.SRTP_GCM_TAG
+    var word = 0
+    if rtcp
+        word = 4
+    tag + c.mki_len + word
+
+// Turn the RTP packet in `pkt` into an SRTP packet.
+//
+// The packet must be an RTP packet with a header of version 2.  Its index
+// is estimated from the sequence number as a receiver would; an index that
+// was protected before, or is more than 63 below the highest, is refused
+// with `SRTP_ERR_REPLAY`, because a keystream or an AES-GCM IV used twice
+// gives away the plaintext (RFC 3711 section 9.1, RFC 7714 section 8.4).
+// Answers `SRTP_OK`, `SRTP_ERR_ARGUMENT` for a context with no profile,
+// `SRTP_ERR_BAD_PACKET`, `SRTP_ERR_KEY_LIFE` when the master key has
+// protected 2^48 packets, `SRTP_ERR_NO_ROOM` when the buffer cannot hold
+// the tag and the identifier, or `SRTP_ERR_REPLAY`.
+//
+// ```novo
+// use rtpbytes
+// use srtpaes
+// use srtpctx
+// use srtp
+//
+// fn main() [io]
+//     var key: srtpaes.SrtpBytes = Vec.new()
+//     var salt: srtpaes.SrtpBytes = Vec.new()
+//     for i in 0..16
+//         let _ = key.push(i as u8)
+//     for i in 0..14
+//         let _ = salt.push(i as u8)
+//     var c = srtpctx.empty()
+//     let _ = srtpctx.init(var c, srtpctx.SRTP_AES128_CM_SHA1_80, var key, var salt, 0)
+//     var p: rtpbytes.RtpBuf = Vec.new()
+//     for b in [0x80, 0x00, 0x00, 0x01, 0, 0, 0, 160, 0, 0, 0, 7, 1, 2, 3]
+//         let _ = p.push(b as u8)
+//     let st = srtp.protect_rtp(var c, var p)
+//     println("${st} ${p.len()}")   // 0 25
+// ```
+pub @tier(embedded)
+@no_alloc
+fn protect_rtp(var c: srtpctx.SrtpCtx, var pkt: rtpbytes.RtpBuf) -> Int []
+    if c.profile == 0
+        return srtpctx.SRTP_ERR_ARGUMENT
+    let hl = header_len(var pkt)
+    if hl < 0
+        return srtpctx.SRTP_ERR_BAD_PACKET
+    let ssrc = rtpbytes.get_u32(var pkt, 8)
+    let index = srtpindex.estimate(c.rtp, rtpbytes.get_u16(var pkt, 2))
+    if index >= SRTP_INDEX_MAX
+        return srtpctx.SRTP_ERR_KEY_LIFE
+    if pkt.len() + overhead(var c, false) > rtpbytes.RTP_BUF_MAX
+        return srtpctx.SRTP_ERR_NO_ROOM
+    if not srtpindex.fresh(c.rtp, index, srtpindex.SRTP_INDEX_BITS)
+        return srtpctx.SRTP_ERR_REPLAY
+    srtpctx.ensure_keys(var c, false, index)
+    let body = pkt.len() - hl
+    if srtpctx.is_gcm(c.profile)
+        var iv: srtpaes.SrtpBytes = Vec.new()
+        srtpctx.iv_gcm(var c.rtp_salt, ssrc, index, var iv)
+        // The room for the tag was checked above, so this cannot refuse.
+        let _ = srtpgcm.seal(var c.rtp_gk, var iv, var pkt, hl, false, 0, body)
+        put_be(var pkt, c.mki, c.mki_len)
+    else
+        srtpaes.ctr_xor(c.rtp_gk.k, srtpctx.iv_cm(var c.rtp_salt, ssrc, index), var pkt, hl, body)
+        var tag: srtpmac.SrtpDigest = Vec.new()
+        tag_of(var c.rtp_auth, var pkt, pkt.len(), true, index >>> 16, var tag)
+        put_be(var pkt, c.mki, c.mki_len)
+        put_tag(var pkt, var tag, srtpctx.rtp_tag_len(c.profile))
+    srtpindex.accept(var c.rtp, index, srtpindex.SRTP_INDEX_BITS)
+    srtpctx.SRTP_OK
+
+// Put back the master key identifier that was taken off the end of a packet
+// before a failed check.
+@tier(embedded)
+@no_alloc
+fn restore_mki(var c: srtpctx.SrtpCtx, var pkt: rtpbytes.RtpBuf) []
+    put_be(var pkt, c.mki, c.mki_len)
+
+// The master key identifier a protected packet carries, as a number, or -1
+// when the context has none or the packet is too short to hold one.
+//
+// A receiver that holds a context for each of several master keys reads
+// this to choose the context.
+pub @tier(embedded)
+@no_alloc
+fn packet_mki(var c: srtpctx.SrtpCtx, var pkt: rtpbytes.RtpBuf, rtcp: Bool) -> Int []
+    if c.mki_len == 0
+        return -1
+    var tag = srtpctx.rtp_tag_len(c.profile)
+    if rtcp
+        tag = srtpctx.rtcp_tag_len(c.profile)
+    let at = pkt.len() - tag - c.mki_len
+    if at < 0
+        return -1
+    get_be(var pkt, at, c.mki_len)
+
+// Turn the SRTP packet in `pkt` back into an RTP packet.
+//
+// The checks are in the order of RFC 3711 section 3.3: the identifier, the
+// replay list, the tag, and only then the decryption.  The index is
+// estimated from the sequence number and the highest one accepted, and the
+// replay window moves when the tag has been verified and not before.
+// Answers `SRTP_OK`, `SRTP_ERR_BAD_PACKET` for a packet shorter than its
+// header and its tag, `SRTP_ERR_MKI`, `SRTP_ERR_REPLAY` or `SRTP_ERR_AUTH`.
+pub @tier(embedded)
+@no_alloc
+fn unprotect_rtp(var c: srtpctx.SrtpCtx, var pkt: rtpbytes.RtpBuf) -> Int []
+    if c.profile == 0
+        return srtpctx.SRTP_ERR_ARGUMENT
+    let hl = header_len(var pkt)
+    if hl < 0 or pkt.len() < hl + overhead(var c, false)
+        return srtpctx.SRTP_ERR_BAD_PACKET
+    if c.mki_len > 0 and packet_mki(var c, var pkt, false) != c.mki
+        return srtpctx.SRTP_ERR_MKI
+    let ssrc = rtpbytes.get_u32(var pkt, 8)
+    let index = srtpindex.estimate(c.rtp, rtpbytes.get_u16(var pkt, 2))
+    if not srtpindex.fresh(c.rtp, index, srtpindex.SRTP_INDEX_BITS)
+        return srtpctx.SRTP_ERR_REPLAY
+    srtpctx.ensure_keys(var c, false, index)
+    if srtpctx.is_gcm(c.profile)
+        var iv: srtpaes.SrtpBytes = Vec.new()
+        srtpctx.iv_gcm(var c.rtp_salt, ssrc, index, var iv)
+        drop_tail(var pkt, c.mki_len)
+        if not srtpgcm.open(var c.rtp_gk, var iv, var pkt, hl, false, 0,
+                            pkt.len() - hl - srtpgcm.SRTP_GCM_TAG)
+            restore_mki(var c, var pkt)
+            return srtpctx.SRTP_ERR_AUTH
+    else
+        let tl = srtpctx.rtp_tag_len(c.profile)
+        let end = pkt.len() - tl - c.mki_len
+        var tag: srtpmac.SrtpDigest = Vec.new()
+        tag_of(var c.rtp_auth, var pkt, end, true, index >>> 16, var tag)
+        if not srtpmac.tag_equals(var tag, var pkt, pkt.len() - tl, tl)
+            return srtpctx.SRTP_ERR_AUTH
+        drop_tail(var pkt, tl + c.mki_len)
+        srtpaes.ctr_xor(c.rtp_gk.k, srtpctx.iv_cm(var c.rtp_salt, ssrc, index), var pkt, hl,
+                        pkt.len() - hl)
+    srtpindex.accept(var c.rtp, index, srtpindex.SRTP_INDEX_BITS)
+    srtpctx.SRTP_OK
+
+// Turn the compound RTCP packet in `pkt` into an SRTCP packet.
+//
+// The packet must hold at least the eight bytes of the first header and the
+// SSRC of the sender, with the version 2.  `encrypt` sets the E bit: with it
+// the bytes after the first eight are encrypted, and without it the packet
+// is only authenticated.  The SRTCP index is the context's counter, which
+// starts at 0 and goes up by one for each packet; the master key protects
+// 2^31 packets.  Answers `SRTP_OK`, `SRTP_ERR_ARGUMENT`,
+// `SRTP_ERR_BAD_PACKET`, `SRTP_ERR_KEY_LIFE` or `SRTP_ERR_NO_ROOM`.
+pub @tier(embedded)
+@no_alloc
+fn protect_rtcp(var c: srtpctx.SrtpCtx, var pkt: rtpbytes.RtpBuf, encrypt: Bool) -> Int []
+    if c.profile == 0
+        return srtpctx.SRTP_ERR_ARGUMENT
+    if pkt.len() < 8 or (rtpbytes.get_u8(var pkt, 0) >> 6) != 2
+        return srtpctx.SRTP_ERR_BAD_PACKET
+    let index = c.rtcp_next
+    if index > SRTCP_INDEX_MAX
+        return srtpctx.SRTP_ERR_KEY_LIFE
+    if pkt.len() + overhead(var c, true) > rtpbytes.RTP_BUF_MAX
+        return srtpctx.SRTP_ERR_NO_ROOM
+    let ssrc = rtpbytes.get_u32(var pkt, 4)
+    srtpctx.ensure_keys(var c, true, index)
+    var word = index
+    var body = 0
+    if encrypt
+        word = index | 0x80000000
+        body = pkt.len() - 8
+    if srtpctx.is_gcm(c.profile)
+        var iv: srtpaes.SrtpBytes = Vec.new()
+        srtpctx.iv_gcm(var c.rtcp_salt, ssrc, index, var iv)
+        // The room for the tag and the word was checked above.
+        let _ = srtpgcm.seal(var c.rtcp_gk, var iv, var pkt, pkt.len() - body, true, word, body)
+        put_be(var pkt, word, 4)
+        put_be(var pkt, c.mki, c.mki_len)
+    else
+        if encrypt
+            srtpaes.ctr_xor(c.rtcp_gk.k, srtpctx.iv_cm(var c.rtcp_salt, ssrc, index), var pkt, 8, body)
+        put_be(var pkt, word, 4)
+        var tag: srtpmac.SrtpDigest = Vec.new()
+        tag_of(var c.rtcp_auth, var pkt, pkt.len(), false, 0, var tag)
+        put_be(var pkt, c.mki, c.mki_len)
+        put_tag(var pkt, var tag, srtpctx.rtcp_tag_len(c.profile))
+    c.rtcp_next = index + 1
+    srtpctx.SRTP_OK
+
+// Turn the SRTCP packet in `pkt` back into a compound RTCP packet.
+//
+// The checks are the identifier, the replay list over the 31-bit SRTCP index
+// the packet carries, and the tag, and then the decryption when the E bit is
+// set.  The replay window moves only when the tag has been verified.
+// Answers `SRTP_OK`, `SRTP_ERR_BAD_PACKET`, `SRTP_ERR_MKI`,
+// `SRTP_ERR_REPLAY` or `SRTP_ERR_AUTH`.
+pub @tier(embedded)
+@no_alloc
+fn unprotect_rtcp(var c: srtpctx.SrtpCtx, var pkt: rtpbytes.RtpBuf) -> Int []
+    if c.profile == 0
+        return srtpctx.SRTP_ERR_ARGUMENT
+    if pkt.len() < 8 + overhead(var c, true) or (rtpbytes.get_u8(var pkt, 0) >> 6) != 2
+        return srtpctx.SRTP_ERR_BAD_PACKET
+    if c.mki_len > 0 and packet_mki(var c, var pkt, true) != c.mki
+        return srtpctx.SRTP_ERR_MKI
+    var tl = srtpctx.rtcp_tag_len(c.profile)
+    if srtpctx.is_gcm(c.profile)
+        tl = 0
+    let word_at = pkt.len() - tl - c.mki_len - 4
+    let word = get_be(var pkt, word_at, 4)
+    let index = word & 0x7FFFFFFF
+    let ssrc = rtpbytes.get_u32(var pkt, 4)
+    if not srtpindex.fresh(c.rtcp, index, srtpindex.SRTCP_INDEX_BITS)
+        return srtpctx.SRTP_ERR_REPLAY
+    srtpctx.ensure_keys(var c, true, index)
+    let encrypted = (word >>> 31) == 1
+    if srtpctx.is_gcm(c.profile)
+        var iv: srtpaes.SrtpBytes = Vec.new()
+        srtpctx.iv_gcm(var c.rtcp_salt, ssrc, index, var iv)
+        drop_tail(var pkt, c.mki_len + 4)
+        var aad = pkt.len() - srtpgcm.SRTP_GCM_TAG
+        var n = 0
+        if encrypted
+            aad = 8
+            n = pkt.len() - 8 - srtpgcm.SRTP_GCM_TAG
+        if not srtpgcm.open(var c.rtcp_gk, var iv, var pkt, aad, true, word, n)
+            put_be(var pkt, word, 4)
+            restore_mki(var c, var pkt)
+            return srtpctx.SRTP_ERR_AUTH
+    else
+        var tag: srtpmac.SrtpDigest = Vec.new()
+        tag_of(var c.rtcp_auth, var pkt, word_at + 4, false, 0, var tag)
+        if not srtpmac.tag_equals(var tag, var pkt, pkt.len() - tl, tl)
+            return srtpctx.SRTP_ERR_AUTH
+        drop_tail(var pkt, tl + c.mki_len + 4)
+        if encrypted
+            srtpaes.ctr_xor(c.rtcp_gk.k, srtpctx.iv_cm(var c.rtcp_salt, ssrc, index), var pkt, 8,
+                            pkt.len() - 8)
+    srtpindex.accept(var c.rtcp, index, srtpindex.SRTCP_INDEX_BITS)
+    srtpctx.SRTP_OK

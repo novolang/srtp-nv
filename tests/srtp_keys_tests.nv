@@ -1,0 +1,392 @@
+// srtp_keys_tests.nv — where the master keys come from: the exporter bytes of
+// DTLS-SRTP (RFC 5764 section 4.2) and the SDES crypto attribute (RFC 4568).
+//
+// THE SDES TEXTS ARE THE RFC'S.  The attribute values of RFC 4568 section 6.1
+// are read byte for byte: the 30-byte key and salt of
+// `d0RmdmcmVCspeEc3QGZiNWpVLFJhQX1cfHAwJSoj` (which the test decodes with
+// Python's base64 module, shown in the comment), the lifetime `2^20`, the
+// identifier `1:4`, and the decimal identifier `1066:4`.  The examples of
+// section 7 that this package refuses are refused for the reason the RFC's
+// grammar gives: `F8_128_HMAC_SHA1_80` is a suite it does not implement, an
+// identifier of 32 bytes is longer than 8, and `FEC_ORDER` is a session
+// parameter it does not implement.
+//
+// THE KEYS OF DTLS-SRTP have no RFC vector, because the exporter is a TLS
+// stack's output.  The test lays 0, 1, 2, ... in the exporter and checks that
+// each side's context was keyed from the bytes RFC 5764 section 4.2 assigns
+// it, by protecting with one and unprotecting with the other.
+
+use std.str
+use std.test
+use rtpbytes
+use srtpaes
+use srtpctx
+use srtpdtls
+use srtpsdes
+use srtp
+
+fn hexval(c: Int) -> Int
+    if c >= 48 and c <= 57
+        return c - 48
+    if c >= 97 and c <= 102
+        return c - 87
+    -1
+
+fn digit(v: Int) -> Int
+    if v < 10
+        return 48 + v
+    87 + v
+
+fn hex_of_bytes(var d: srtpaes.SrtpBytes) -> Str
+    var s = ""
+    for i in 0..d.len()
+        let b = d[i] as Int
+        s = s + str.from_byte(digit(b >> 4)) + str.from_byte(digit(b & 15))
+    s
+
+fn hex_of(var d: rtpbytes.RtpBuf) -> Str
+    var s = ""
+    for i in 0..d.len()
+        let b = d[i] as Int
+        s = s + str.from_byte(digit(b >> 4)) + str.from_byte(digit(b & 15))
+    s
+
+// The text a `SdesText` holds.
+fn text_of(var t: srtpsdes.SdesText) -> Str
+    var s = ""
+    for i in 0..t.len()
+        s = s + str.from_byte(t[i] as Int)
+    s
+
+fn rtp_pkt(seq: Int) -> rtpbytes.RtpBuf
+    var p: rtpbytes.RtpBuf = Vec.new()
+    for b in [0x80, 0x60, seq >> 8, seq & 255, 0, 0, 0, 160, 0x11, 0x22, 0x33, 0x44, 1, 2, 3, 4, 5]
+        let _ = p.push(b as u8)
+    p
+
+fn all_profiles() -> [Int]
+    [srtpctx.SRTP_AES128_CM_SHA1_80, srtpctx.SRTP_AES128_CM_SHA1_32, srtpctx.SRTP_AES256_CM_SHA1_80,
+     srtpctx.SRTP_AES256_CM_SHA1_32, srtpctx.SRTP_AEAD_AES128_GCM, srtpctx.SRTP_AEAD_AES256_GCM]
+
+// The key and salt of a profile as the SDES tests use them, in base64.
+fn b64_of(profile: Int) -> Str
+    if profile == srtpctx.SRTP_AES128_CM_SHA1_80 or profile == srtpctx.SRTP_AES128_CM_SHA1_32
+        return "AAECAwQFBgcICQoLDA0OD6ChoqOkpaanqKmqq6yt"
+    if profile == srtpctx.SRTP_AES256_CM_SHA1_80 or profile == srtpctx.SRTP_AES256_CM_SHA1_32
+        return "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh+goaKjpKWmp6ipqqusrQ=="
+    if profile == srtpctx.SRTP_AEAD_AES128_GCM
+        return "AAECAwQFBgcICQoLDA0OD6ChoqOkpaanqKmqqw=="
+    "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh+goaKjpKWmp6ipqqs="
+
+fn rfc_example() -> Str
+    "1 AES_CM_128_HMAC_SHA1_80 inline:d0RmdmcmVCspeEc3QGZiNWpVLFJhQX1cfHAwJSoj|2^20|1:4"
+
+fn status_of(s: Str) -> Int
+    srtpsdes.parse(s).status
+
+@test
+fn test_dtls_gives_each_side_the_keys_rfc_5764_assigns_it() [io]
+    test.case("the number of exported bytes: 2 * (key + salt)")
+    test.assert_eq(srtpdtls.exporter_len(srtpctx.SRTP_AES128_CM_SHA1_80), 60)
+    test.assert_eq(srtpdtls.exporter_len(srtpctx.SRTP_AES256_CM_SHA1_32), 92)
+    test.assert_eq(srtpdtls.exporter_len(srtpctx.SRTP_AEAD_AES128_GCM), 56)
+    test.assert_eq(srtpdtls.exporter_len(srtpctx.SRTP_AEAD_AES256_GCM), 88)
+    test.assert_eq(srtpdtls.exporter_len(5), 0)
+    test.assert_eq(srtpdtls.exporter_len(0), 0)
+    for profile in all_profiles()
+        var e: srtpdtls.SrtpExporter = Vec.new()
+        for i in 0..srtpdtls.exporter_len(profile)
+            let _ = e.push((i * 3 + 1) as u8)
+        var c_send = srtpctx.empty()
+        var c_recv = srtpctx.empty()
+        var s_send = srtpctx.empty()
+        var s_recv = srtpctx.empty()
+        test.assert_eq(srtpdtls.contexts(profile, var e, true, var c_send, var c_recv), srtpctx.SRTP_OK)
+        test.assert_eq(srtpdtls.contexts(profile, var e, false, var s_send, var s_recv), srtpctx.SRTP_OK)
+        test.case("what the client sends, the server receives; and the other way")
+        var p = rtp_pkt(7)
+        test.assert_eq(srtp.protect_rtp(var c_send, var p), srtpctx.SRTP_OK)
+        var seen = hex_of(var p)
+        test.assert_eq(srtp.unprotect_rtp(var s_recv, var p), srtpctx.SRTP_OK)
+        var q = rtp_pkt(9)
+        test.assert_eq(srtp.protect_rtp(var s_send, var q), srtpctx.SRTP_OK)
+        test.assert_eq(srtp.unprotect_rtp(var c_recv, var q), srtpctx.SRTP_OK)
+        test.case("the two directions use different keys: the client cannot read its own packets")
+        var r = rtp_pkt(7)
+        test.assert_eq(srtp.protect_rtp(var s_send, var r), srtpctx.SRTP_OK)
+        test.assert(hex_of(var r) != seen)
+        test.case("the client's context is keyed from the first key and the first salt")
+        var key: srtpaes.SrtpBytes = Vec.new()
+        var salt: srtpaes.SrtpBytes = Vec.new()
+        let kl = srtpctx.key_len(profile)
+        let sl = srtpctx.salt_len(profile)
+        for i in 0..kl
+            let _ = key.push((i * 3 + 1) as u8)
+        for i in 0..sl
+            let _ = salt.push(((2 * kl + i) * 3 + 1) as u8)
+        var by_hand = srtpctx.empty()
+        test.assert_eq(srtpctx.init(var by_hand, profile, var key, var salt, 0), srtpctx.SRTP_OK)
+        var t = rtp_pkt(7)
+        test.assert_eq(srtp.protect_rtp(var by_hand, var t), srtpctx.SRTP_OK)
+        test.assert_eq(hex_of(var t), seen)
+
+@test
+fn test_dtls_refuses_an_exporter_of_the_wrong_length_and_an_unknown_profile() [io]
+    var e: srtpdtls.SrtpExporter = Vec.new()
+    for i in 0..59
+        let _ = e.push(i as u8)
+    var a = srtpctx.empty()
+    var b = srtpctx.empty()
+    test.assert_eq(srtpdtls.contexts(srtpctx.SRTP_AES128_CM_SHA1_80, var e, true, var a, var b),
+        srtpctx.SRTP_ERR_ARGUMENT)
+    test.assert_eq(a.profile, 0)
+    test.assert_eq(srtpdtls.contexts(5, var e, true, var a, var b), srtpctx.SRTP_ERR_ARGUMENT)
+    let _ = e.push(60 as u8)
+    test.assert_eq(srtpdtls.contexts(srtpctx.SRTP_AES128_CM_SHA1_80, var e, true, var a, var b), srtpctx.SRTP_OK)
+    let _ = e.push(61 as u8)
+    test.assert_eq(srtpdtls.contexts(srtpctx.SRTP_AES128_CM_SHA1_80, var e, true, var a, var b),
+        srtpctx.SRTP_ERR_ARGUMENT)
+    test.assert_eq(srtpdtls.SRTP_EXPORTER_MAX, 96)
+
+@test
+fn test_sdes_reads_the_example_of_rfc_4568_section_6_1() [io]
+    // Python: base64.b64decode("d0RmdmcmVCspeEc3QGZiNWpVLFJhQX1cfHAwJSoj").hex()
+    //   774466766726542b29784737406662356a552c5261417d5c7c7030252a23
+    // The first 16 bytes are the key and the last 14 the salt.
+    let c = srtpsdes.parse(rfc_example())
+    test.assert_eq(c.status, srtpsdes.SDES_OK)
+    test.assert_eq(c.tag, 1)
+    test.assert_eq(c.profile, srtpctx.SRTP_AES128_CM_SHA1_80)
+    var key = c.key
+    var salt = c.salt
+    test.assert_eq(hex_of_bytes(var key), "774466766726542b2978473740666235")
+    test.assert_eq(hex_of_bytes(var salt), "6a552c5261417d5c7c7030252a23")
+    test.assert_eq(c.lifetime, 1048576)
+    test.assert_eq(c.mki, 1)
+    test.assert_eq(c.mki_len, 4)
+    test.assert_eq(c.kdr_exp, 0)
+    test.assert_eq(c.wsh, 0)
+    test.assert(not c.unencrypted_srtp and not c.unencrypted_srtcp and not c.unauthenticated_srtp)
+    test.case("the second example: no lifetime, the identifier 1066 of 4 bytes")
+    let d = srtpsdes.parse("3 AES_CM_128_HMAC_SHA1_80 inline:YUJDZGVmZ2hpSktMbW9QUXJzVHVWd3l6MTIzNDU2|1066:4")
+    test.assert_eq(d.status, srtpsdes.SDES_OK)
+    test.assert_eq(d.lifetime, 0)
+    test.assert_eq(d.mki, 1066)
+    test.assert_eq(d.mki_len, 4)
+    test.case("the suite of the second media section of section 7")
+    let e = srtpsdes.parse("1 AES_CM_128_HMAC_SHA1_32 inline:NzB4d1BINUAvLEw6UzF3WSJ+PSdFcGdUJShpX1Zj|2^20|1:4")
+    test.assert_eq(e.status, srtpsdes.SDES_OK)
+    test.assert_eq(e.profile, srtpctx.SRTP_AES128_CM_SHA1_32)
+
+@test
+fn test_sdes_reads_every_suite_with_and_without_padding() [io]
+    for profile in all_profiles()
+        let text = "9 " + srtpsdes.suite_name(profile) + " inline:" + b64_of(profile)
+        let c = srtpsdes.parse(text)
+        test.assert_eq(c.status, srtpsdes.SDES_OK)
+        test.assert_eq(c.profile, profile)
+        test.assert_eq(c.key.len(), srtpctx.key_len(profile))
+        test.assert_eq(c.salt.len(), srtpctx.salt_len(profile))
+        var salt = c.salt
+        test.assert_eq(salt[0] as Int, 0xA0)
+        test.case("the padding may be left off")
+        var bare = b64_of(profile)
+        while str.ends_with(bare, "=")
+            bare = str.slice(bare, 0, str.len(bare) - 1)
+        let d = srtpsdes.parse("9 " + srtpsdes.suite_name(profile) + " inline:" + bare)
+        test.assert_eq(d.status, srtpsdes.SDES_OK)
+        test.assert_eq(d.lifetime, 0)
+
+@test
+fn test_sdes_reads_the_session_parameters() [io]
+    let c = srtpsdes.parse(rfc_example() + " KDR=10 WSH=128 UNENCRYPTED_SRTP UNENCRYPTED_SRTCP UNAUTHENTICATED_SRTP")
+    test.assert_eq(c.status, srtpsdes.SDES_OK)
+    test.assert_eq(c.kdr_exp, 10)
+    test.assert_eq(c.wsh, 128)
+    test.assert(c.unencrypted_srtp and c.unencrypted_srtcp and c.unauthenticated_srtp)
+    let d = srtpsdes.parse(rfc_example() + " KDR=24")
+    test.assert_eq(d.kdr_exp, 24)
+    test.assert_eq(d.lifetime, 1048576)
+    test.assert_eq(d.mki_len, 4)
+
+@test
+fn test_sdes_refuses_text_that_is_not_an_attribute() [io]
+    test.case("the tag")
+    test.assert_eq(status_of(""), srtpsdes.SDES_ERR_SYNTAX)
+    test.assert_eq(status_of("x AES_CM_128_HMAC_SHA1_80 inline:" + b64_of(1)), srtpsdes.SDES_ERR_SYNTAX)
+    test.assert_eq(status_of("0 AES_CM_128_HMAC_SHA1_80 inline:" + b64_of(1)), srtpsdes.SDES_ERR_SYNTAX)
+    test.assert_eq(status_of("1234567890 AES_CM_128_HMAC_SHA1_80 inline:" + b64_of(1)), srtpsdes.SDES_ERR_SYNTAX)
+    test.assert_eq(status_of("1"), srtpsdes.SDES_ERR_SYNTAX)
+    test.assert_eq(status_of("123456789 AES_CM_128_HMAC_SHA1_80 inline:" + b64_of(1)), srtpsdes.SDES_OK)
+    test.case("a suite and nothing after it")
+    test.assert_eq(status_of("1 AES_CM_128_HMAC_SHA1_80"), srtpsdes.SDES_ERR_SYNTAX)
+    test.case("a key method other than inline")
+    test.assert_eq(status_of("1 AES_CM_128_HMAC_SHA1_80 uri:" + b64_of(1)), srtpsdes.SDES_ERR_SYNTAX)
+    test.assert_eq(status_of("1 AES_CM_128_HMAC_SHA1_80 inlin"), srtpsdes.SDES_ERR_SYNTAX)
+    test.case("a lifetime that is zero, too large, not a number, empty, or given twice")
+    let k = " inline:" + b64_of(1)
+    test.assert_eq(status_of("1 AES_CM_128_HMAC_SHA1_80" + k + "|0"), srtpsdes.SDES_ERR_SYNTAX)
+    test.assert_eq(status_of("1 AES_CM_128_HMAC_SHA1_80" + k + "|2^49"), srtpsdes.SDES_ERR_SYNTAX)
+    test.assert_eq(status_of("1 AES_CM_128_HMAC_SHA1_80" + k + "|2^48"), srtpsdes.SDES_OK)
+    test.assert_eq(status_of("1 AES_CM_128_HMAC_SHA1_80" + k + "|281474976710656"), srtpsdes.SDES_OK)
+    test.assert_eq(status_of("1 AES_CM_128_HMAC_SHA1_80" + k + "|281474976710657"), srtpsdes.SDES_ERR_SYNTAX)
+    test.assert_eq(status_of("1 AES_CM_128_HMAC_SHA1_80" + k + "|abc"), srtpsdes.SDES_ERR_SYNTAX)
+    test.assert_eq(status_of("1 AES_CM_128_HMAC_SHA1_80" + k + "|2^x"), srtpsdes.SDES_ERR_SYNTAX)
+    test.assert_eq(status_of("1 AES_CM_128_HMAC_SHA1_80" + k + "|"), srtpsdes.SDES_ERR_SYNTAX)
+    test.assert_eq(status_of("1 AES_CM_128_HMAC_SHA1_80" + k + "|2^20|2^20"), srtpsdes.SDES_ERR_SYNTAX)
+    test.assert_eq(status_of("1 AES_CM_128_HMAC_SHA1_80" + k + "|007"), srtpsdes.SDES_ERR_SYNTAX)
+    test.case("a lifetime after the identifier")
+    test.assert_eq(status_of("1 AES_CM_128_HMAC_SHA1_80" + k + "|1:4|2^20"), srtpsdes.SDES_ERR_SYNTAX)
+    test.case("an identifier with no length, a length of 0 or over 128, no value, or given twice")
+    test.assert_eq(status_of("1 AES_CM_128_HMAC_SHA1_80" + k + "|1:"), srtpsdes.SDES_ERR_SYNTAX)
+    test.assert_eq(status_of("1 AES_CM_128_HMAC_SHA1_80" + k + "|1:0"), srtpsdes.SDES_ERR_SYNTAX)
+    test.assert_eq(status_of("1 AES_CM_128_HMAC_SHA1_80" + k + "|1:129"), srtpsdes.SDES_ERR_SYNTAX)
+    test.assert_eq(status_of("1 AES_CM_128_HMAC_SHA1_80" + k + "|:4"), srtpsdes.SDES_ERR_SYNTAX)
+    test.assert_eq(status_of("1 AES_CM_128_HMAC_SHA1_80" + k + "|1:4|2:4"), srtpsdes.SDES_ERR_SYNTAX)
+    test.case("more fields than a lifetime and an identifier")
+    test.assert_eq(status_of("1 AES_CM_128_HMAC_SHA1_80" + k + "|2^20|1:4|9"), srtpsdes.SDES_ERR_SYNTAX)
+
+@test
+fn test_sdes_refuses_a_suite_a_key_or_a_parameter_it_does_not_implement() [io]
+    let k = " inline:" + b64_of(1)
+    test.case("suites: the f8 suite of RFC 4568, a name that is only a prefix, an empty name")
+    test.assert_eq(status_of("1 F8_128_HMAC_SHA1_80" + k), srtpsdes.SDES_ERR_SUITE)
+    test.assert_eq(status_of("1 AES_CM_128_HMAC_SHA1_8" + k), srtpsdes.SDES_ERR_SUITE)
+    test.assert_eq(status_of("1  inline:" + b64_of(1)), srtpsdes.SDES_ERR_SUITE)
+    test.case("keys: not base64, the wrong length for the suite, an odd length, too long")
+    test.assert_eq(status_of("1 AES_CM_128_HMAC_SHA1_80 inline:$$$$$$$$"), srtpsdes.SDES_ERR_KEY)
+    test.assert_eq(status_of("1 AES_CM_128_HMAC_SHA1_80 inline:AAAAAAAAAAAAAAAAAAAAAA=="), srtpsdes.SDES_ERR_KEY)
+    test.assert_eq(status_of("1 AEAD_AES_128_GCM inline:" + b64_of(1)), srtpsdes.SDES_ERR_KEY)
+    test.assert_eq(status_of("1 AES_CM_128_HMAC_SHA1_80 inline:AAAAA"), srtpsdes.SDES_ERR_KEY)
+    test.assert_eq(status_of("1 AES_CM_128_HMAC_SHA1_80 inline:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7"),
+        srtpsdes.SDES_ERR_KEY)
+    test.assert_eq(status_of("1 AES_CM_128_HMAC_SHA1_80 inline:"), srtpsdes.SDES_ERR_KEY)
+    test.case("several keys, FEC, an identifier longer than 8 bytes or too big for its length")
+    test.assert_eq(status_of("1 AES_CM_128_HMAC_SHA1_80" + k + "|2^20|1:4;inline:" + b64_of(1) + "|2^20|2:4"),
+        srtpsdes.SDES_ERR_PARAM)
+    test.assert_eq(status_of("1 AES_CM_128_HMAC_SHA1_80 inline:PS1uQCVeeCFCanVmcjkpPywjNWhcYD0mXXtxaVBR|2^20|1:32"),
+        srtpsdes.SDES_ERR_PARAM)
+    test.assert_eq(status_of("1 AES_CM_128_HMAC_SHA1_80" + k + "|256:1"), srtpsdes.SDES_ERR_PARAM)
+    test.assert_eq(status_of("1 AES_CM_128_HMAC_SHA1_80" + k + "|255:1"), srtpsdes.SDES_OK)
+    test.assert_eq(status_of("1 AES_CM_128_HMAC_SHA1_80" + k + "|5:8"), srtpsdes.SDES_OK)
+    test.case("session parameters: FEC_ORDER of the RFC's own example, KDR and WSH out of range, a stray space")
+    test.assert_eq(status_of("1 AES_CM_128_HMAC_SHA1_80 inline:WVNfX19zZW1jdGwgKCkgewkyMjA7fQp9CnVubGVz|2^20|1:4 FEC_ORDER=FEC_SRTP"),
+        srtpsdes.SDES_ERR_PARAM)
+    test.assert_eq(status_of("1 AES_CM_128_HMAC_SHA1_80" + k + " KDR=0"), srtpsdes.SDES_ERR_PARAM)
+    test.assert_eq(status_of("1 AES_CM_128_HMAC_SHA1_80" + k + " KDR=25"), srtpsdes.SDES_ERR_PARAM)
+    test.assert_eq(status_of("1 AES_CM_128_HMAC_SHA1_80" + k + " KDR=x"), srtpsdes.SDES_ERR_PARAM)
+    test.assert_eq(status_of("1 AES_CM_128_HMAC_SHA1_80" + k + " WSH=63"), srtpsdes.SDES_ERR_PARAM)
+    test.assert_eq(status_of("1 AES_CM_128_HMAC_SHA1_80" + k + " WSH=64"), srtpsdes.SDES_OK)
+    test.assert_eq(status_of("1 AES_CM_128_HMAC_SHA1_80" + k + " WSH=abc"), srtpsdes.SDES_ERR_PARAM)
+    test.assert_eq(status_of("1 AES_CM_128_HMAC_SHA1_80" + k + "  KDR=2"), srtpsdes.SDES_ERR_PARAM)
+    test.assert_eq(status_of("1 AES_CM_128_HMAC_SHA1_80" + k + " UNKNOWN"), srtpsdes.SDES_ERR_PARAM)
+
+@test
+fn test_sdes_writes_what_it_reads() [io]
+    test.case("the example of the RFC comes back unchanged")
+    var t: srtpsdes.SdesText = Vec.new()
+    test.assert(srtpsdes.write(srtpsdes.parse(rfc_example()), var t))
+    test.assert_eq(text_of(var t), rfc_example())
+    test.assert_eq(t.len(), 82)
+    test.case("every suite, with the padding of the base64")
+    for profile in all_profiles()
+        let text = "7 " + srtpsdes.suite_name(profile) + " inline:" + b64_of(profile) + "|1000000|9:2 KDR=3 WSH=100 UNENCRYPTED_SRTP UNENCRYPTED_SRTCP UNAUTHENTICATED_SRTP"
+        var out: srtpsdes.SdesText = Vec.new()
+        test.assert(srtpsdes.write(srtpsdes.parse(text), var out))
+        test.assert_eq(text_of(var out), text)
+    test.case("a lifetime that is a power of two is written as 2^n, and one that is not as a number")
+    var u: srtpsdes.SdesText = Vec.new()
+    test.assert(srtpsdes.write(srtpsdes.parse("1 AES_CM_128_HMAC_SHA1_80 inline:" + b64_of(1) + "|1048576"), var u))
+    test.assert(str.ends_with(text_of(var u), "|2^20"))
+    test.assert(srtpsdes.write(srtpsdes.parse("1 AES_CM_128_HMAC_SHA1_80 inline:" + b64_of(1) + "|1048577"), var u))
+    test.assert(str.ends_with(text_of(var u), "|1048577"))
+    test.assert(srtpsdes.write(srtpsdes.parse("1 AES_CM_128_HMAC_SHA1_80 inline:" + b64_of(1) + "|2^0"), var u))
+    test.assert(str.ends_with(text_of(var u), "|2^0"))
+    test.case("an attribute that is a fault, has no profile, a short key, a short salt or no tag is not written")
+    var v: srtpsdes.SdesText = Vec.new()
+    test.assert(not srtpsdes.write(srtpsdes.parse("junk"), var v))
+    let good = srtpsdes.parse(rfc_example())
+    let no_profile = srtpsdes.SdesCrypto { status: 0, tag: 1, profile: 0, key: good.key, salt: good.salt,
+        lifetime: 0, mki: 0, mki_len: 0, kdr_exp: 0, wsh: 0, unencrypted_srtp: false,
+        unencrypted_srtcp: false, unauthenticated_srtp: false }
+    test.assert(not srtpsdes.write(no_profile, var v))
+    var short_key: srtpaes.SrtpBytes = Vec.new()
+    let _ = short_key.push(1 as u8)
+    let bad_key = srtpsdes.SdesCrypto { status: 0, tag: 1, profile: 1, key: short_key, salt: good.salt,
+        lifetime: 0, mki: 0, mki_len: 0, kdr_exp: 0, wsh: 0, unencrypted_srtp: false,
+        unencrypted_srtcp: false, unauthenticated_srtp: false }
+    test.assert(not srtpsdes.write(bad_key, var v))
+    let bad_salt = srtpsdes.SdesCrypto { status: 0, tag: 1, profile: 1, key: good.key, salt: short_key,
+        lifetime: 0, mki: 0, mki_len: 0, kdr_exp: 0, wsh: 0, unencrypted_srtp: false,
+        unencrypted_srtcp: false, unauthenticated_srtp: false }
+    test.assert(not srtpsdes.write(bad_salt, var v))
+    let bad_tag = srtpsdes.SdesCrypto { status: 0, tag: 0, profile: 1, key: good.key, salt: good.salt,
+        lifetime: 0, mki: 0, mki_len: 0, kdr_exp: 0, wsh: 0, unencrypted_srtp: false,
+        unencrypted_srtcp: false, unauthenticated_srtp: false }
+    test.assert(not srtpsdes.write(bad_tag, var v))
+    test.case("text that does not fit in 192 bytes is not written: every number of 19 digits and every parameter")
+    let big = srtpsdes.parse("1 AES_256_CM_HMAC_SHA1_80 inline:" + b64_of(3))
+    let huge = srtpsdes.SdesCrypto { status: 0, tag: 9223372036854775807, profile: 3, key: big.key,
+        salt: big.salt, lifetime: 9223372036854775807, mki: 9223372036854775807, mki_len: 8,
+        kdr_exp: 24, wsh: 9223372036854775807, unencrypted_srtp: true, unencrypted_srtcp: true,
+        unauthenticated_srtp: true }
+    var w: srtpsdes.SdesText = Vec.new()
+    test.assert(not srtpsdes.write(huge, var w))
+    test.assert_eq(w.len(), 192)
+    test.case("a key whose base64 holds the slash")
+    let slashes = "1 AES_CM_128_HMAC_SHA1_80 inline:" + str.repeat("/", 40)
+    let sl = srtpsdes.parse(slashes)
+    test.assert_eq(sl.status, srtpsdes.SDES_OK)
+    var sk = sl.key
+    test.assert_eq(hex_of_bytes(var sk), "ffffffffffffffffffffffffffffffff")
+    var so: srtpsdes.SdesText = Vec.new()
+    test.assert(srtpsdes.write(sl, var so))
+    test.assert_eq(text_of(var so), slashes)
+
+@test
+fn test_a_context_is_set_up_from_an_sdes_attribute() [io]
+    let a = srtpsdes.parse(rfc_example() + " KDR=4")
+    var tx = srtpctx.empty()
+    var rx = srtpctx.empty()
+    test.assert_eq(srtpsdes.init_ctx(var tx, a), srtpctx.SRTP_OK)
+    test.assert_eq(srtpsdes.init_ctx(var rx, a), srtpctx.SRTP_OK)
+    test.assert_eq(tx.kdr, 16)
+    test.assert_eq(tx.mki_len, 4)
+    test.assert_eq(tx.mki, 1)
+    var p = rtp_pkt(5)
+    test.assert_eq(srtp.protect_rtp(var tx, var p), srtpctx.SRTP_OK)
+    test.assert_eq(srtp.packet_mki(var tx, var p, false), 1)
+    test.assert_eq(srtp.unprotect_rtp(var rx, var p), srtpctx.SRTP_OK)
+    test.case("no rate means a rate of 0")
+    var plain = srtpctx.empty()
+    test.assert_eq(srtpsdes.init_ctx(var plain, srtpsdes.parse(rfc_example())), srtpctx.SRTP_OK)
+    test.assert_eq(plain.kdr, 0)
+    test.case("an attribute that is a fault, or asks for no encryption or no authentication, is refused")
+    var c = srtpctx.empty()
+    test.assert_eq(srtpsdes.init_ctx(var c, srtpsdes.parse("junk")), srtpctx.SRTP_ERR_ARGUMENT)
+    test.assert_eq(srtpsdes.init_ctx(var c, srtpsdes.parse(rfc_example() + " UNENCRYPTED_SRTP")),
+        srtpctx.SRTP_ERR_ARGUMENT)
+    test.assert_eq(srtpsdes.init_ctx(var c, srtpsdes.parse(rfc_example() + " UNENCRYPTED_SRTCP")),
+        srtpctx.SRTP_ERR_ARGUMENT)
+    test.assert_eq(srtpsdes.init_ctx(var c, srtpsdes.parse(rfc_example() + " UNAUTHENTICATED_SRTP")),
+        srtpctx.SRTP_ERR_ARGUMENT)
+    test.case("a hand-built attribute that names no profile, or a bad identifier, is refused by the context")
+    let good = srtpsdes.parse(rfc_example())
+    let no_profile = srtpsdes.SdesCrypto { status: 0, tag: 1, profile: 99, key: good.key, salt: good.salt,
+        lifetime: 0, mki: 0, mki_len: 0, kdr_exp: 0, wsh: 0, unencrypted_srtp: false,
+        unencrypted_srtcp: false, unauthenticated_srtp: false }
+    test.assert_eq(srtpsdes.init_ctx(var c, no_profile), srtpctx.SRTP_ERR_ARGUMENT)
+    let bad_mki = srtpsdes.SdesCrypto { status: 0, tag: 1, profile: 1, key: good.key, salt: good.salt,
+        lifetime: 0, mki: 1, mki_len: 9, kdr_exp: 0, wsh: 0, unencrypted_srtp: false,
+        unencrypted_srtcp: false, unauthenticated_srtp: false }
+    test.assert_eq(srtpsdes.init_ctx(var c, bad_mki), srtpctx.SRTP_ERR_ARGUMENT)
+
+@test
+fn test_suite_names_are_the_ones_of_the_rfcs() [io]
+    test.assert_eq(srtpsdes.suite_name(srtpctx.SRTP_AES128_CM_SHA1_80), "AES_CM_128_HMAC_SHA1_80")
+    test.assert_eq(srtpsdes.suite_name(srtpctx.SRTP_AES128_CM_SHA1_32), "AES_CM_128_HMAC_SHA1_32")
+    test.assert_eq(srtpsdes.suite_name(srtpctx.SRTP_AES256_CM_SHA1_80), "AES_256_CM_HMAC_SHA1_80")
+    test.assert_eq(srtpsdes.suite_name(srtpctx.SRTP_AES256_CM_SHA1_32), "AES_256_CM_HMAC_SHA1_32")
+    test.assert_eq(srtpsdes.suite_name(srtpctx.SRTP_AEAD_AES128_GCM), "AEAD_AES_128_GCM")
+    test.assert_eq(srtpsdes.suite_name(srtpctx.SRTP_AEAD_AES256_GCM), "AEAD_AES_256_GCM")
+    test.assert_eq(srtpsdes.suite_name(5), "")

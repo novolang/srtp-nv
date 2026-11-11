@@ -1,0 +1,340 @@
+// srtp_tests.nv — whole SRTP and SRTCP packets, against libsrtp.
+//
+// THE PACKETS ARE FROM AN INDEPENDENT IMPLEMENTATION.  RFC 3711 and RFC 7714
+// print no complete packet for the counter-mode profiles, and RFC 7714 prints
+// its packets under session keys rather than master keys, so the packets
+// here were protected by libsrtp 2 (the Cisco library that browsers and
+// GStreamer use, version 2.5 of Ubuntu 24.04) driven through Python's
+// ctypes.  Each profile was created with
+//
+//     master key   000102...0f (AES-128) or 000102...1f (AES-256)
+//     master salt  a0a1a2...ad (14 bytes) or a0a1a2...ab (12 bytes, AES-GCM)
+//     SSRC         0x11223344, key derivation rate 0, no MKI
+//
+// and `srtp_protect` / `srtp_protect_rtcp` called on the plain packets in
+// the test, in order.  The test checks both directions: this package
+// protects the plain packet to the same bytes, and unprotects libsrtp's
+// bytes to the plain packet.
+//
+// libsrtp sends the first SRTCP packet with the index 1 and RFC 3711 section
+// 3.4 says the index is zero before the first packet is sent, so the
+// tests set the index to 1 for the comparison and a test at the end of
+// `srtp_edge_tests.nv` shows the default of 0.
+
+use std.str
+use std.test
+use rtpbytes
+use srtpaes
+use srtpctx
+use srtp
+
+// The value of a hexadecimal digit, or -1.
+fn hexval(c: Int) -> Int
+    if c >= 48 and c <= 57
+        return c - 48
+    if c >= 97 and c <= 102
+        return c - 87
+    -1
+
+// A packet from a hexadecimal dump, lower case.
+fn pkt_hex(s: Str) -> rtpbytes.RtpBuf
+    var m: rtpbytes.RtpBuf = Vec.new()
+    var hi = -1
+    for i in 0..str.len(s)
+        let v = hexval(str.byte_at_or(s, i, 0))
+        if v >= 0
+            if hi < 0
+                hi = v
+            else
+                let _ = m.push((hi * 16 + v) as u8)
+                hi = -1
+    m
+
+fn digit(v: Int) -> Int
+    if v < 10
+        return 48 + v
+    87 + v
+
+// The lower-case hexadecimal of a packet.
+fn hex_of(var d: rtpbytes.RtpBuf) -> Str
+    var s = ""
+    for i in 0..d.len()
+        let b = d[i] as Int
+        s = s + str.from_byte(digit(b >> 4)) + str.from_byte(digit(b & 15))
+    s
+
+// The master key of a profile: 0 through 15, or 0 through 31 for AES-256.
+fn master_key(profile: Int) -> srtpaes.SrtpBytes
+    var k: srtpaes.SrtpBytes = Vec.new()
+    for i in 0..srtpctx.key_len(profile)
+        let _ = k.push(i as u8)
+    k
+
+// The master salt of a profile: 0xA0 and up, 14 bytes or 12 for AES-GCM.
+fn master_salt(profile: Int) -> srtpaes.SrtpBytes
+    var s: srtpaes.SrtpBytes = Vec.new()
+    for i in 0..srtpctx.salt_len(profile)
+        let _ = s.push((0xA0 + i) as u8)
+    s
+
+// A context for the profile with the key and salt above.
+fn ctx_of(profile: Int) -> srtpctx.SrtpCtx
+    var c = srtpctx.empty()
+    var k = master_key(profile)
+    var s = master_salt(profile)
+    test.assert_eq(srtpctx.init(var c, profile, var k, var s, 0), srtpctx.SRTP_OK)
+    c
+
+// Protect `plain` with the sender and compare with `prot`; unprotect `prot`
+// with the receiver and compare with `plain`.
+fn check_rtp(var tx: srtpctx.SrtpCtx, var rx: srtpctx.SrtpCtx, plain: Str, prot: Str)
+    var p = pkt_hex(plain)
+    test.assert_eq(srtp.protect_rtp(var tx, var p), srtpctx.SRTP_OK)
+    test.assert_eq(hex_of(var p), prot)
+    var q = pkt_hex(prot)
+    test.assert_eq(srtp.unprotect_rtp(var rx, var q), srtpctx.SRTP_OK)
+    test.assert_eq(hex_of(var q), plain)
+
+// The same for a compound RTCP packet.
+fn check_rtcp(var tx: srtpctx.SrtpCtx, var rx: srtpctx.SrtpCtx, plain: Str, prot: Str,
+              encrypt: Bool)
+    var p = pkt_hex(plain)
+    test.assert_eq(srtp.protect_rtcp(var tx, var p, encrypt), srtpctx.SRTP_OK)
+    test.assert_eq(hex_of(var p), prot)
+    var q = pkt_hex(prot)
+    test.assert_eq(srtp.unprotect_rtcp(var rx, var q), srtpctx.SRTP_OK)
+    test.assert_eq(hex_of(var q), plain)
+
+@test
+fn test_cm128_80_rtp_packets_match_libsrtp() [io]
+    test.case("AES_CM_128_HMAC_SHA1_80: four RTP packets, the last with a CSRC and an extension")
+    var tx = ctx_of(srtpctx.SRTP_AES128_CM_SHA1_80)
+    var rx = ctx_of(srtpctx.SRTP_AES128_CM_SHA1_80)
+    check_rtp(var tx, var rx, "80000001000000a0112233440102030405",
+              "80000001000000a0112233441f3d4baf562188c9368cd29b26ef11")
+    check_rtp(var tx, var rx, "80000002000000a01122334402030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20212223242526272829",
+              "80000002000000a0112233445fcc9b35cfc300330375a76614cc7d03fdf7f5db5042e0b51d30be91d9bdad136bdce47e89ce2a8c10fac306454becaada7c")
+    check_rtp(var tx, var rx, "80000003000000a011223344",
+              "80000003000000a0112233448c7b7c12c047de8d83e1")
+    check_rtp(var tx, var rx, "916000040000014011223344cafebabebede000110aa0000090a0b0c0d0e0f",
+              "916000040000014011223344cafebabebede000110aa0000ff0658cd0008f95db50dcefdfdfd68c318")
+
+@test
+fn test_cm128_80_rtcp_packets_match_libsrtp() [io]
+    test.case("AES_CM_128_HMAC_SHA1_80: three encrypted RTCP packets, SRTCP index 1, 2, 3")
+    var tx = ctx_of(srtpctx.SRTP_AES128_CM_SHA1_80)
+    var rx = ctx_of(srtpctx.SRTP_AES128_CM_SHA1_80)
+    test.assert_eq(srtpctx.set_rtcp_index(var tx, 1), srtpctx.SRTP_OK)
+    check_rtcp(var tx, var rx, "81c8000611223344404142434445464748494a4b4c4d4e4f50515253",
+               "81c800061122334437a546722fbdbdb9cb083c5fe2b7b5e654f10c4680000001b398a63b059734a1ccff", true)
+    check_rtcp(var tx, var rx, "81c80007112233444142434445464748494a4b4c4d4e4f505152535455565758",
+               "81c8000711223344c91f00772e06ab0978d532292b7087b11739ec29b09c5ec0800000029f2e6c3c9db4a0c73161", true)
+    check_rtcp(var tx, var rx, "81c800081122334442434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d",
+               "81c8000811223344d6e608f78b5009f8759fab49309322ea5fa90ff15ad6cd1fd1bc898780000003df694ed46f1a3b513005", true)
+    test.case("AES_CM_128_HMAC_SHA1_80: an RTCP packet that is only authenticated, the E bit clear")
+    var ta = ctx_of(srtpctx.SRTP_AES128_CM_SHA1_80)
+    var ra = ctx_of(srtpctx.SRTP_AES128_CM_SHA1_80)
+    test.assert_eq(srtpctx.set_rtcp_index(var ta, 1), srtpctx.SRTP_OK)
+    check_rtcp(var ta, var ra, "81c8000711223344707172737475767778797a7b7c7d7e7f8081828384858687",
+               "81c8000711223344707172737475767778797a7b7c7d7e7f808182838485868700000001ebbf5a5504adea6af92a", false)
+
+@test
+fn test_cm128_32_rtp_packets_match_libsrtp() [io]
+    test.case("AES_CM_128_HMAC_SHA1_32: four RTP packets, the last with a CSRC and an extension")
+    var tx = ctx_of(srtpctx.SRTP_AES128_CM_SHA1_32)
+    var rx = ctx_of(srtpctx.SRTP_AES128_CM_SHA1_32)
+    check_rtp(var tx, var rx, "80000001000000a0112233440102030405",
+              "80000001000000a0112233441f3d4baf562188c936")
+    check_rtp(var tx, var rx, "80000002000000a01122334402030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20212223242526272829",
+              "80000002000000a0112233445fcc9b35cfc300330375a76614cc7d03fdf7f5db5042e0b51d30be91d9bdad136bdce47e89ce2a8c10fac306")
+    check_rtp(var tx, var rx, "80000003000000a011223344",
+              "80000003000000a0112233448c7b7c12")
+    check_rtp(var tx, var rx, "916000040000014011223344cafebabebede000110aa0000090a0b0c0d0e0f",
+              "916000040000014011223344cafebabebede000110aa0000ff0658cd0008f95db50dce")
+
+@test
+fn test_cm128_32_rtcp_packets_match_libsrtp() [io]
+    test.case("AES_CM_128_HMAC_SHA1_32: three encrypted RTCP packets, SRTCP index 1, 2, 3")
+    var tx = ctx_of(srtpctx.SRTP_AES128_CM_SHA1_32)
+    var rx = ctx_of(srtpctx.SRTP_AES128_CM_SHA1_32)
+    test.assert_eq(srtpctx.set_rtcp_index(var tx, 1), srtpctx.SRTP_OK)
+    check_rtcp(var tx, var rx, "81c8000611223344404142434445464748494a4b4c4d4e4f50515253",
+               "81c800061122334437a546722fbdbdb9cb083c5fe2b7b5e654f10c4680000001b398a63b059734a1ccff", true)
+    check_rtcp(var tx, var rx, "81c80007112233444142434445464748494a4b4c4d4e4f505152535455565758",
+               "81c8000711223344c91f00772e06ab0978d532292b7087b11739ec29b09c5ec0800000029f2e6c3c9db4a0c73161", true)
+    check_rtcp(var tx, var rx, "81c800081122334442434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d",
+               "81c8000811223344d6e608f78b5009f8759fab49309322ea5fa90ff15ad6cd1fd1bc898780000003df694ed46f1a3b513005", true)
+    test.case("AES_CM_128_HMAC_SHA1_32: an RTCP packet that is only authenticated, the E bit clear")
+    var ta = ctx_of(srtpctx.SRTP_AES128_CM_SHA1_32)
+    var ra = ctx_of(srtpctx.SRTP_AES128_CM_SHA1_32)
+    test.assert_eq(srtpctx.set_rtcp_index(var ta, 1), srtpctx.SRTP_OK)
+    check_rtcp(var ta, var ra, "81c8000711223344707172737475767778797a7b7c7d7e7f8081828384858687",
+               "81c8000711223344707172737475767778797a7b7c7d7e7f808182838485868700000001ebbf5a5504adea6af92a", false)
+
+@test
+fn test_cm256_80_rtp_packets_match_libsrtp() [io]
+    test.case("AES_CM_256_HMAC_SHA1_80: four RTP packets, the last with a CSRC and an extension")
+    var tx = ctx_of(srtpctx.SRTP_AES256_CM_SHA1_80)
+    var rx = ctx_of(srtpctx.SRTP_AES256_CM_SHA1_80)
+    check_rtp(var tx, var rx, "80000001000000a0112233440102030405",
+              "80000001000000a0112233440cdf0376de14ebd758a6cb629a1c23")
+    check_rtp(var tx, var rx, "80000002000000a01122334402030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20212223242526272829",
+              "80000002000000a011223344996c1cb85ec8aee919ccea967e6cf685e6a377c5dde2cf72483ce89f84769898701b736ff69dffedfe8dac21fa66690f6b3d")
+    check_rtp(var tx, var rx, "80000003000000a011223344",
+              "80000003000000a01122334440ea953835a5902dcc4b")
+    check_rtp(var tx, var rx, "916000040000014011223344cafebabebede000110aa0000090a0b0c0d0e0f",
+              "916000040000014011223344cafebabebede000110aa0000f5cb6b97d1fc0df4ab3ee6ba7c8b88f41c")
+
+@test
+fn test_cm256_80_rtcp_packets_match_libsrtp() [io]
+    test.case("AES_CM_256_HMAC_SHA1_80: three encrypted RTCP packets, SRTCP index 1, 2, 3")
+    var tx = ctx_of(srtpctx.SRTP_AES256_CM_SHA1_80)
+    var rx = ctx_of(srtpctx.SRTP_AES256_CM_SHA1_80)
+    test.assert_eq(srtpctx.set_rtcp_index(var tx, 1), srtpctx.SRTP_OK)
+    check_rtcp(var tx, var rx, "81c8000611223344404142434445464748494a4b4c4d4e4f50515253",
+               "81c800061122334487a7af72ea89c49edeccb5cc1991b6657a8a740e800000015f90f6a53ee6399475a1", true)
+    check_rtcp(var tx, var rx, "81c80007112233444142434445464748494a4b4c4d4e4f505152535455565758",
+               "81c8000711223344670c3c671645a97cece03626e7c1f66e07e783fa48d9bca680000002730184b8ce5cbd230169", true)
+    check_rtcp(var tx, var rx, "81c800081122334442434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d",
+               "81c8000811223344977856218e65cffe452e905a1c801b451a7ca8b54be2163c4d10d9af80000003b1ed6ae8897c3eb3168d", true)
+    test.case("AES_CM_256_HMAC_SHA1_80: an RTCP packet that is only authenticated, the E bit clear")
+    var ta = ctx_of(srtpctx.SRTP_AES256_CM_SHA1_80)
+    var ra = ctx_of(srtpctx.SRTP_AES256_CM_SHA1_80)
+    test.assert_eq(srtpctx.set_rtcp_index(var ta, 1), srtpctx.SRTP_OK)
+    check_rtcp(var ta, var ra, "81c8000711223344707172737475767778797a7b7c7d7e7f8081828384858687",
+               "81c8000711223344707172737475767778797a7b7c7d7e7f80818283848586870000000147c1a255866498838d71", false)
+
+@test
+fn test_cm256_32_rtp_packets_match_libsrtp() [io]
+    test.case("AES_CM_256_HMAC_SHA1_32: four RTP packets, the last with a CSRC and an extension")
+    var tx = ctx_of(srtpctx.SRTP_AES256_CM_SHA1_32)
+    var rx = ctx_of(srtpctx.SRTP_AES256_CM_SHA1_32)
+    check_rtp(var tx, var rx, "80000001000000a0112233440102030405",
+              "80000001000000a0112233440cdf0376de14ebd758")
+    check_rtp(var tx, var rx, "80000002000000a01122334402030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20212223242526272829",
+              "80000002000000a011223344996c1cb85ec8aee919ccea967e6cf685e6a377c5dde2cf72483ce89f84769898701b736ff69dffedfe8dac21")
+    check_rtp(var tx, var rx, "80000003000000a011223344",
+              "80000003000000a01122334440ea9538")
+    check_rtp(var tx, var rx, "916000040000014011223344cafebabebede000110aa0000090a0b0c0d0e0f",
+              "916000040000014011223344cafebabebede000110aa0000f5cb6b97d1fc0df4ab3ee6")
+
+@test
+fn test_cm256_32_rtcp_packets_match_libsrtp() [io]
+    test.case("AES_CM_256_HMAC_SHA1_32: three encrypted RTCP packets, SRTCP index 1, 2, 3")
+    var tx = ctx_of(srtpctx.SRTP_AES256_CM_SHA1_32)
+    var rx = ctx_of(srtpctx.SRTP_AES256_CM_SHA1_32)
+    test.assert_eq(srtpctx.set_rtcp_index(var tx, 1), srtpctx.SRTP_OK)
+    check_rtcp(var tx, var rx, "81c8000611223344404142434445464748494a4b4c4d4e4f50515253",
+               "81c800061122334487a7af72ea89c49edeccb5cc1991b6657a8a740e800000015f90f6a53ee6399475a1", true)
+    check_rtcp(var tx, var rx, "81c80007112233444142434445464748494a4b4c4d4e4f505152535455565758",
+               "81c8000711223344670c3c671645a97cece03626e7c1f66e07e783fa48d9bca680000002730184b8ce5cbd230169", true)
+    check_rtcp(var tx, var rx, "81c800081122334442434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d",
+               "81c8000811223344977856218e65cffe452e905a1c801b451a7ca8b54be2163c4d10d9af80000003b1ed6ae8897c3eb3168d", true)
+    test.case("AES_CM_256_HMAC_SHA1_32: an RTCP packet that is only authenticated, the E bit clear")
+    var ta = ctx_of(srtpctx.SRTP_AES256_CM_SHA1_32)
+    var ra = ctx_of(srtpctx.SRTP_AES256_CM_SHA1_32)
+    test.assert_eq(srtpctx.set_rtcp_index(var ta, 1), srtpctx.SRTP_OK)
+    check_rtcp(var ta, var ra, "81c8000711223344707172737475767778797a7b7c7d7e7f8081828384858687",
+               "81c8000711223344707172737475767778797a7b7c7d7e7f80818283848586870000000147c1a255866498838d71", false)
+
+@test
+fn test_gcm128_rtp_packets_match_libsrtp() [io]
+    test.case("AEAD_AES_128_GCM: four RTP packets, the last with a CSRC and an extension")
+    var tx = ctx_of(srtpctx.SRTP_AEAD_AES128_GCM)
+    var rx = ctx_of(srtpctx.SRTP_AEAD_AES128_GCM)
+    check_rtp(var tx, var rx, "80000001000000a0112233440102030405",
+              "80000001000000a011223344dd0c5220daca810261d95f5c5ee0f69dbc57f90cc5")
+    check_rtp(var tx, var rx, "80000002000000a01122334402030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20212223242526272829",
+              "80000002000000a011223344a6a8ae9268adda424b6eb5e358b58d49205047c5bc4dace459e4da49b8f7c5470465f11f28a28a4aa90617899f87fa79c6829a9e91ab428f")
+    check_rtp(var tx, var rx, "80000003000000a011223344",
+              "80000003000000a011223344257ed36ebac14d26dbc0e3e37184051f")
+    check_rtp(var tx, var rx, "916000040000014011223344cafebabebede000110aa0000090a0b0c0d0e0f",
+              "916000040000014011223344cafebabebede000110aa000095c587cb4bf38c39c4a47f210bdfd1025fa8e58fa9212d")
+
+@test
+fn test_gcm128_rtcp_packets_match_libsrtp() [io]
+    test.case("AEAD_AES_128_GCM: three encrypted RTCP packets, SRTCP index 1, 2, 3")
+    var tx = ctx_of(srtpctx.SRTP_AEAD_AES128_GCM)
+    var rx = ctx_of(srtpctx.SRTP_AEAD_AES128_GCM)
+    test.assert_eq(srtpctx.set_rtcp_index(var tx, 1), srtpctx.SRTP_OK)
+    check_rtcp(var tx, var rx, "81c8000611223344404142434445464748494a4b4c4d4e4f50515253",
+               "81c80006112233441d703894a31da7b58f4fce468ce779b6724e305f6e8a6917806c818c0eabb43c6889ae5780000001", true)
+    check_rtcp(var tx, var rx, "81c80007112233444142434445464748494a4b4c4d4e4f505152535455565758",
+               "81c8000711223344b98e23a225163232504f315bd4edd5d2825e57ad7c12a96fc584b24edef462a06afb316c4958c3f480000002", true)
+    check_rtcp(var tx, var rx, "81c800081122334442434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d",
+               "81c80008112233440b68cb5375c5c3883c4d676e56617a5bbfc0474024b8dd50ad0f1957404e6018301767b77792a64a673c2e8180000003", true)
+    test.case("AEAD_AES_128_GCM: an RTCP packet that is only authenticated, the E bit clear")
+    var ta = ctx_of(srtpctx.SRTP_AEAD_AES128_GCM)
+    var ra = ctx_of(srtpctx.SRTP_AEAD_AES128_GCM)
+    test.assert_eq(srtpctx.set_rtcp_index(var ta, 1), srtpctx.SRTP_OK)
+    check_rtcp(var ta, var ra, "81c8000711223344707172737475767778797a7b7c7d7e7f8081828384858687",
+               "81c8000711223344707172737475767778797a7b7c7d7e7f808182838485868712db5ff5fa420f3408c4bd79345edab500000001", false)
+
+@test
+fn test_gcm256_rtp_packets_match_libsrtp() [io]
+    test.case("AEAD_AES_256_GCM: four RTP packets, the last with a CSRC and an extension")
+    var tx = ctx_of(srtpctx.SRTP_AEAD_AES256_GCM)
+    var rx = ctx_of(srtpctx.SRTP_AEAD_AES256_GCM)
+    check_rtp(var tx, var rx, "80000001000000a0112233440102030405",
+              "80000001000000a011223344e8755683f145a7b2bfae148267d1c20a3a5fd677a6")
+    check_rtp(var tx, var rx, "80000002000000a01122334402030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20212223242526272829",
+              "80000002000000a011223344507cf394dceac49e1a803a7eed54a5c3d8d9811e3ca3c7f2faa3b3324d272a04b20dead82b12aa912e376d8467982eb81d6d1f9e5282cc9a")
+    check_rtp(var tx, var rx, "80000003000000a011223344",
+              "80000003000000a011223344a97916141826b3f3cdb5b7d653cad18c")
+    check_rtp(var tx, var rx, "916000040000014011223344cafebabebede000110aa0000090a0b0c0d0e0f",
+              "916000040000014011223344cafebabebede000110aa000002314242ada3852267dee1fcd57fd3bfe26d06bd767e04")
+
+@test
+fn test_gcm256_rtcp_packets_match_libsrtp() [io]
+    test.case("AEAD_AES_256_GCM: three encrypted RTCP packets, SRTCP index 1, 2, 3")
+    var tx = ctx_of(srtpctx.SRTP_AEAD_AES256_GCM)
+    var rx = ctx_of(srtpctx.SRTP_AEAD_AES256_GCM)
+    test.assert_eq(srtpctx.set_rtcp_index(var tx, 1), srtpctx.SRTP_OK)
+    check_rtcp(var tx, var rx, "81c8000611223344404142434445464748494a4b4c4d4e4f50515253",
+               "81c8000611223344317ed17cb5652718eaac28c064004782e0990cfd655c75335d96dc28ce5a7be8b22b913080000001", true)
+    check_rtcp(var tx, var rx, "81c80007112233444142434445464748494a4b4c4d4e4f505152535455565758",
+               "81c80007112233446d1b17c86b5de5fda6f3ee7d70ca9493877b213b6c02e250a6666fb59ae5b18ef52a65ce2a3997c680000002", true)
+    check_rtcp(var tx, var rx, "81c800081122334442434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d",
+               "81c8000811223344b3e2c7e2a8b9601e0d935231a5fb58a57a3216125b4317e914169a4d5c2790b80dbd5fc4d05537bd59279d2480000003", true)
+    test.case("AEAD_AES_256_GCM: an RTCP packet that is only authenticated, the E bit clear")
+    var ta = ctx_of(srtpctx.SRTP_AEAD_AES256_GCM)
+    var ra = ctx_of(srtpctx.SRTP_AEAD_AES256_GCM)
+    test.assert_eq(srtpctx.set_rtcp_index(var ta, 1), srtpctx.SRTP_OK)
+    check_rtcp(var ta, var ra, "81c8000711223344707172737475767778797a7b7c7d7e7f8081828384858687",
+               "81c8000711223344707172737475767778797a7b7c7d7e7f8081828384858687dcdec5c5e5e976a204ddcfec04d59efd00000001", false)
+
+@test
+fn test_cm128_80_rollover_counter_is_carried_across_the_sequence_wrap() [io]
+    test.case("AES_CM_128_HMAC_SHA1_80: sequence numbers 65534, 65535, 0, 1, 2 give the ROC 0, 0, 1, 1, 1")
+    var tx = ctx_of(srtpctx.SRTP_AES128_CM_SHA1_80)
+    var rx = ctx_of(srtpctx.SRTP_AES128_CM_SHA1_80)
+    check_rtp(var tx, var rx, "8000fffe000000a011223344feff000102030405",
+              "8000fffe000000a011223344a5cdb6d5d05ad9d30ed5498de05c36ea945c")
+    check_rtp(var tx, var rx, "8000ffff000000a011223344ff00010203040506",
+              "8000ffff000000a01122334482495e29e121c52f5374013f0be7d7069bc5")
+    check_rtp(var tx, var rx, "80000000000000a0112233440001020304050607",
+              "80000000000000a0112233447f102e7aca7c03498ef08880ebfb97ffc978")
+    check_rtp(var tx, var rx, "80000001000000a0112233440102030405060708",
+              "80000001000000a011223344d0b98bb2793208837eb5a832bed087d0f527")
+    check_rtp(var tx, var rx, "80000002000000a0112233440203040506070809",
+              "80000002000000a011223344797dbf8a851a2c72cd4ad1e48052a409e124")
+    test.assert_eq(tx.rtp.top, 65536 + 2)
+    test.assert_eq(rx.rtp.top, 65536 + 2)
+
+@test
+fn test_gcm128_rollover_counter_is_carried_across_the_sequence_wrap() [io]
+    test.case("AEAD_AES_128_GCM: sequence numbers 65534, 65535, 0, 1, 2 give the ROC 0, 0, 1, 1, 1")
+    var tx = ctx_of(srtpctx.SRTP_AEAD_AES128_GCM)
+    var rx = ctx_of(srtpctx.SRTP_AEAD_AES128_GCM)
+    check_rtp(var tx, var rx, "8000fffe000000a011223344feff000102030405",
+              "8000fffe000000a011223344d911498792e28a9b44e291646df1c7ad8f0913e80fab8719")
+    check_rtp(var tx, var rx, "8000ffff000000a011223344ff00010203040506",
+              "8000ffff000000a011223344f7a3e044deb54d912809f96c682f635b9ea09a5b6efd632d")
+    check_rtp(var tx, var rx, "80000000000000a0112233440001020304050607",
+              "80000000000000a011223344de65ec4e71969e551cba144a1c09ad896f6e7a6c3072bd63")
+    check_rtp(var tx, var rx, "80000001000000a0112233440102030405060708",
+              "80000001000000a01122334418e4768a2ced7f25648a21f4dbbbf7880bd7d8bd3a23dfcc")
+    check_rtp(var tx, var rx, "80000002000000a0112233440203040506070809",
+              "80000002000000a0112233447fd3acd7a6e0ae23a63c9e84248e38d8bb1b70ad2d866a45")
+    test.assert_eq(tx.rtp.top, 65536 + 2)
+    test.assert_eq(rx.rtp.top, 65536 + 2)

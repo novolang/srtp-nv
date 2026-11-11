@@ -1,0 +1,132 @@
+// srtpmac_tests.nv — HMAC-SHA1, against the test cases of RFC 2202.
+//
+// THE VECTORS ARE PUBLISHED, NOT RECORDED FROM THIS CODE.  RFC 2202
+// section 3 gives seven test cases for HMAC-SHA1.  The key of SRTP is 20
+// bytes, which is what `SrtpAuthKey` holds, so the cases whose key is 20
+// bytes or shorter are here: 1 (20 bytes of 0x0b), 2 (the four bytes
+// "Jefe"), 3 (20 bytes of 0xaa over 50 bytes of 0xdd) and 5 (20 bytes of
+// 0x0c, whose digest the RFC also prints cut to 96 bits).  Cases 4, 6 and 7
+// have keys of 25, 80 and 80 bytes.
+
+use std.str
+use std.test
+use rtpbytes
+use srtpmac
+
+fn digit(v: Int) -> Int
+    if v < 10
+        return 48 + v
+    87 + v
+
+// The lower-case hexadecimal of a tag.
+fn hex_of(var d: srtpmac.SrtpDigest) -> Str
+    var s = ""
+    for i in 0..d.len()
+        let b = d[i] as Int
+        s = s + str.from_byte(digit(b >> 4)) + str.from_byte(digit(b & 15))
+    s
+
+// A key of `n` bytes all equal to `v`.
+fn key_rep(v: Int, n: Int) -> srtpmac.SrtpAuthKey
+    var k: srtpmac.SrtpAuthKey = Vec.new()
+    for _i in 0..n
+        let _ = k.push(v as u8)
+    k
+
+// The HMAC of a string under a key, in hexadecimal.
+fn hmac_hex(var key: srtpmac.SrtpAuthKey, s: Str) -> Str
+    var m = srtpmac.hmac_new(var key)
+    for i in 0..str.len(s)
+        srtpmac.hmac_byte(var m, str.byte_at_or(s, i, 0))
+    var t: srtpmac.SrtpDigest = Vec.new()
+    srtpmac.hmac_finish(var m, var key, var t)
+    hex_of(var t)
+
+@test
+fn test_rfc2202_hmac_sha1_cases() [io]
+    test.case("case 1: key 0x0b * 20, data Hi There")
+    var k1 = key_rep(0x0b, 20)
+    test.assert_eq(hmac_hex(var k1, "Hi There"), "b617318655057264e28bc0b6fb378c8ef146be00")
+    test.case("case 2: key Jefe, a key shorter than the block is padded with zeros")
+    var k2: srtpmac.SrtpAuthKey = Vec.new()
+    for c in [74, 101, 102, 101]
+        let _ = k2.push(c as u8)
+    test.assert_eq(hmac_hex(var k2, "what do ya want for nothing?"), "effcdf6ae5eb2fa2d27416d5f184df9c259a7c79")
+    test.case("case 3: key 0xaa * 20, data 0xdd * 50")
+    var k3 = key_rep(0xaa, 20)
+    test.assert_eq(hmac_hex(var k3, str.repeat(str.from_byte(0xdd), 50)),
+        "125d7342b9ac11cd91a39af48aa17b4f63f175d3")
+    test.case("case 5: key 0x0c * 20, data Test With Truncation, and its first 96 bits")
+    var k5 = key_rep(0x0c, 20)
+    test.assert_eq(hmac_hex(var k5, "Test With Truncation"), "4c1a03424b55e07fe7f27be1d58bb9324a9a5a04")
+    test.case("a message of 64 bytes and of 55 bytes, either side of the padding boundary")
+    test.assert_eq(str.len(hmac_hex(var k5, str.repeat("a", 64))), 40)
+    test.assert_eq(str.len(hmac_hex(var k5, str.repeat("a", 55))), 40)
+    test.assert(hmac_hex(var k5, str.repeat("a", 55)) != hmac_hex(var k5, str.repeat("a", 56)))
+
+@test
+fn test_hmac_range_and_u32_feed_the_bytes_of_a_packet() [io]
+    var key = key_rep(0x0b, 20)
+    var p: rtpbytes.RtpBuf = Vec.new()
+    for c in [72, 105, 32, 84, 104, 101, 114, 101]
+        let _ = p.push(c as u8)
+    test.case("a range is the same as the bytes one by one")
+    var m = srtpmac.hmac_new(var key)
+    srtpmac.hmac_range(var m, var p, 0, 8)
+    var t: srtpmac.SrtpDigest = Vec.new()
+    srtpmac.hmac_finish(var m, var key, var t)
+    test.assert_eq(hex_of(var t), "b617318655057264e28bc0b6fb378c8ef146be00")
+    test.case("a range that starts inside the packet and runs past it feeds the bytes that are there")
+    var m2 = srtpmac.hmac_new(var key)
+    srtpmac.hmac_range(var m2, var p, 5, 100)
+    var t2: srtpmac.SrtpDigest = Vec.new()
+    srtpmac.hmac_finish(var m2, var key, var t2)
+    var m3 = srtpmac.hmac_new(var key)
+    srtpmac.hmac_range(var m3, var p, 5, 3)
+    var t3: srtpmac.SrtpDigest = Vec.new()
+    srtpmac.hmac_finish(var m3, var key, var t3)
+    test.assert_eq(hex_of(var t2), hex_of(var t3))
+    test.case("a range that starts before the packet feeds the bytes that are there")
+    var m4 = srtpmac.hmac_new(var key)
+    srtpmac.hmac_range(var m4, var p, -2, 10)
+    var t4: srtpmac.SrtpDigest = Vec.new()
+    srtpmac.hmac_finish(var m4, var key, var t4)
+    test.assert_eq(hex_of(var t4), "b617318655057264e28bc0b6fb378c8ef146be00")
+    test.case("the 32-bit value is fed high byte first")
+    var m5 = srtpmac.hmac_new(var key)
+    srtpmac.hmac_u32(var m5, 0x48692054)
+    var m6 = srtpmac.hmac_new(var key)
+    srtpmac.hmac_range(var m6, var p, 0, 4)
+    var t5: srtpmac.SrtpDigest = Vec.new()
+    var t6: srtpmac.SrtpDigest = Vec.new()
+    srtpmac.hmac_finish(var m5, var key, var t5)
+    srtpmac.hmac_finish(var m6, var key, var t6)
+    test.assert_eq(hex_of(var t5), hex_of(var t6))
+
+@test
+fn test_tag_equals_compares_every_byte_it_is_asked_about() [io]
+    var key = key_rep(0x0b, 20)
+    var m = srtpmac.hmac_new(var key)
+    srtpmac.hmac_byte(var m, 1)
+    var t: srtpmac.SrtpDigest = Vec.new()
+    srtpmac.hmac_finish(var m, var key, var t)
+    var p: rtpbytes.RtpBuf = Vec.new()
+    let _ = p.push(9 as u8)
+    for i in 0..10
+        let _ = p.push(t[i])
+    test.case("the first ten bytes match, at an offset")
+    test.assert(srtpmac.tag_equals(var t, var p, 1, 10))
+    test.case("and the first four")
+    test.assert(srtpmac.tag_equals(var t, var p, 1, 4))
+    test.case("a byte that differs, first or last")
+    p[1] = (p[1] as Int ^ 1) as u8
+    test.assert(not srtpmac.tag_equals(var t, var p, 1, 10))
+    p[1] = (p[1] as Int ^ 1) as u8
+    p[10] = (p[10] as Int ^ 0x80) as u8
+    test.assert(not srtpmac.tag_equals(var t, var p, 1, 10))
+    test.assert(srtpmac.tag_equals(var t, var p, 1, 9))
+    test.case("a range outside the packet or a length outside 0 to 20 is not equal")
+    test.assert(not srtpmac.tag_equals(var t, var p, 5, 10))
+    test.assert(not srtpmac.tag_equals(var t, var p, -1, 4))
+    test.assert(not srtpmac.tag_equals(var t, var p, 1, 21))
+    test.assert(not srtpmac.tag_equals(var t, var p, 1, -1))

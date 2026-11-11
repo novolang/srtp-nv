@@ -1,0 +1,96 @@
+// srtpkdf.nv — the key derivation function of SRTP, RFC 3711 section 4.3.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.  A session key is
+// not the master key.  Each session key is derived from the master key and
+// the master salt by running AES in counter mode as a pseudo-random
+// function, with a different input for each key:
+//
+//     key_id = <label> || (index DIV key_derivation_rate)
+//     x      = key_id XOR master_salt
+//     key    = the first n bytes of the keystream that starts at x * 2^16
+//
+// The label is one byte and says which key it is: 0 the SRTP encryption key,
+// 1 the SRTP authentication key, 2 the SRTP salt, 3 to 5 the same three for
+// SRTCP.  `index DIV key_derivation_rate` is a 48-bit number, zero when the
+// rate is zero, and for SRTCP it is the 31-bit SRTCP index divided by the
+// rate.  `key_id` is 7 bytes and the master salt is 14, and the two are
+// aligned at their least significant ends, which is what puts the label at
+// byte 7 and the index at bytes 8 to 13 of the 14-byte value.  The RFC 7714
+// profiles have a 12-byte master salt, and the RFC does not say where it sits
+// in the 14 bytes.  Every implementation in use, libsrtp among them, takes it
+// as the first 12 bytes of a 14-byte salt that ends in two zero bytes, and so
+// does this one; the vectors of the tests are libsrtp's.
+//
+// With a 256-bit master key the same function is the AES_256_CM_PRF of
+// RFC 6188 section 4.3: the cipher is AES-256 and nothing else changes.
+
+use aes_core
+use srtpaes
+
+// Label: the SRTP encryption key, 0.
+pub const SRTP_LABEL_RTP_ENC = 0
+// Label: the SRTP authentication key, 1.
+pub const SRTP_LABEL_RTP_AUTH = 1
+// Label: the SRTP salt, 2.
+pub const SRTP_LABEL_RTP_SALT = 2
+// Label: the SRTCP encryption key, 3.
+pub const SRTP_LABEL_RTCP_ENC = 3
+// Label: the SRTCP authentication key, 4.
+pub const SRTP_LABEL_RTCP_AUTH = 4
+// Label: the SRTCP salt, 5.
+pub const SRTP_LABEL_RTCP_SALT = 5
+
+// The length of the master salt of the counter-mode profiles, in bytes: 14.
+pub const SRTP_SALT_CM = 14
+// The length of the master salt and the session salt of the AES-GCM
+// profiles, in bytes: 12.
+pub const SRTP_SALT_GCM = 12
+
+// The input block of the pseudo-random function: `x * 2^16` for a master
+// salt of up to 14 bytes, a label and the number `r` (index DIV rate).
+@tier(embedded)
+@no_alloc
+fn input_block(var salt: srtpaes.SrtpBytes, label: Int, r: Int) -> aes_core.AesBlock []
+    var x: srtpaes.SrtpBytes = Vec.new()
+    for _i in 0..16
+        let _ = x.push(0 as u8)
+    var sl = salt.len()
+    if sl > SRTP_SALT_CM
+        sl = SRTP_SALT_CM
+    for i in 0..sl
+        x[i] = salt[i]
+    x[7] = (x[7] as Int ^ label) as u8
+    for i in 0..6
+        x[8 + i] = (x[8 + i] as Int ^ ((r >>> (8 * (5 - i))) & 0xFF)) as u8
+    srtpaes.block_at(var x, 0)
+
+// Derive `n` bytes of the session key named by `label` into `out`,
+// replacing what it held.
+//
+// `k` is the master key expanded with `srtpaes.expand`, `salt` the master
+// salt, and `r` the number `index DIV key_derivation_rate`, which is 0 when
+// the rate is 0.  `n` is at most 32.
+//
+// This is the first derivation of RFC 3711 appendix B.3: the cipher key of
+// the master key E1F97A0D... and the master salt 0EC675AD....
+//
+// ```novo
+// use srtpaes
+// use srtpkdf
+//
+// fn main() [io]
+//     var mk: srtpaes.SrtpBytes = Vec.new()
+//     for b in [0xE1, 0xF9, 0x7A, 0x0D, 0x3E, 0x01, 0x8B, 0xE0, 0xD6, 0x4F, 0xA3, 0x2C, 0x06, 0xDE, 0x41, 0x39]
+//         let _ = mk.push(b as u8)
+//     var salt: srtpaes.SrtpBytes = Vec.new()
+//     for b in [0x0E, 0xC6, 0x75, 0xAD, 0x49, 0x8A, 0xFE, 0xEB, 0xB6, 0x96, 0x0B, 0x3A, 0xAB, 0xE6]
+//         let _ = salt.push(b as u8)
+//     var out: srtpaes.SrtpBytes = Vec.new()
+//     srtpkdf.derive(srtpaes.expand(var mk, 16), var salt, srtpkdf.SRTP_LABEL_RTP_ENC, 0, 16, var out)
+//     println("${out[0]} ${out[15]}")   // 198 135
+// ```
+pub @tier(embedded)
+@no_alloc
+fn derive(k: aes_core.AesKey, var salt: srtpaes.SrtpBytes, label: Int, r: Int, n: Int,
+          var out: srtpaes.SrtpBytes) []
+    srtpaes.keystream(k, input_block(var salt, label, r), n, var out)

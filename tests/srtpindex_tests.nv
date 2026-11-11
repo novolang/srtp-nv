@@ -1,0 +1,108 @@
+// srtpindex_tests.nv — the index estimate of RFC 3711 section 3.3.1 and the
+// replay window of section 3.3.2.
+//
+// THE ESTIMATE IS CHECKED AGAINST THE RULE AS THE RFC WRITES IT.  With the
+// highest sequence number `s_l` under 2^15, a received SEQ more than 2^15
+// above it is of the cycle before (`v = ROC - 1 mod 2^32`), otherwise of this
+// one; with `s_l` of 2^15 or over, a SEQ more than 2^15 below it is of the
+// next cycle (`v = ROC + 1 mod 2^32`), otherwise of this one.  The window is
+// 64 indexes wide, and an index is refused when its bit is set or when it is
+// 64 or more below the highest.
+
+use std.test
+use srtpindex
+
+// A window that has accepted `top`.
+fn after(top: Int) -> srtpindex.SrtpWindow
+    var w = srtpindex.window_new()
+    srtpindex.accept(var w, top, 48)
+    w
+
+@test
+fn test_the_estimate_with_nothing_accepted_is_the_sequence_number() [io]
+    let w = srtpindex.window_new()
+    test.assert_eq(srtpindex.estimate(w, 0), 0)
+    test.assert_eq(srtpindex.estimate(w, 65535), 65535)
+
+@test
+fn test_the_estimate_follows_the_two_halves_of_the_sequence_space() [io]
+    test.case("s_l under 2^15 and SEQ close to it: the same cycle")
+    test.assert_eq(srtpindex.estimate(after(65536 + 100), 150), 65536 + 150)
+    test.assert_eq(srtpindex.estimate(after(65536 + 100), 100 + 32768), 65536 + 100 + 32768)
+    test.case("s_l under 2^15 and SEQ more than 2^15 above: the cycle before")
+    test.assert_eq(srtpindex.estimate(after(65536 + 100), 100 + 32769), 100 + 32769)
+    test.assert_eq(srtpindex.estimate(after(65536 + 100), 65500), 65500)
+    test.case("the cycle before the first is the cycle 2^32 - 1, modulo 2^32")
+    test.assert_eq(srtpindex.estimate(after(100), 65500), (0xFFFFFFFF << 16) | 65500)
+    test.case("s_l of 2^15 or over and SEQ close to it: the same cycle")
+    test.assert_eq(srtpindex.estimate(after(65536 + 50000), 40000), 65536 + 40000)
+    test.assert_eq(srtpindex.estimate(after(65536 + 32768), 0), 65536)
+    test.case("s_l of 2^15 or over and SEQ more than 2^15 below: the next cycle")
+    test.assert_eq(srtpindex.estimate(after(65535), 0), 65536)
+    test.assert_eq(srtpindex.estimate(after(32768), 0), 0)
+    test.assert_eq(srtpindex.estimate(after(32768), 32767), 32767)
+    test.assert_eq(srtpindex.estimate(after(65536 + 40000), 7), 2 * 65536 + 7)
+    test.case("the cycle after the last wraps to 0")
+    test.assert_eq(srtpindex.estimate(after((0xFFFFFFFF << 16) | 65535), 3), 3)
+
+@test
+fn test_the_window_accepts_new_indexes_and_refuses_repeats() [io]
+    test.case("nothing accepted yet: every index is new")
+    let empty = srtpindex.window_new()
+    test.assert(srtpindex.fresh(empty, 5, 48))
+    var w = after(100)
+    test.case("the highest is not fresh, a newer one and an older one are")
+    test.assert(not srtpindex.fresh(w, 100, 48))
+    test.assert(srtpindex.fresh(w, 101, 48))
+    test.assert(srtpindex.fresh(w, 99, 48))
+    test.case("63 below the highest is the oldest that is inside the window; 64 below is not")
+    test.assert(srtpindex.fresh(w, 37, 48))
+    test.assert(not srtpindex.fresh(w, 36, 48))
+    test.case("an accepted index inside the window is no longer fresh")
+    srtpindex.accept(var w, 99, 48)
+    test.assert(not srtpindex.fresh(w, 99, 48))
+    test.assert_eq(w.top, 100)
+    test.assert_eq(w.mask, 3)
+
+@test
+fn test_the_window_moves_with_the_highest_index() [io]
+    var w = after(100)
+    srtpindex.accept(var w, 103, 48)
+    test.case("the mask has the highest at bit 0 and the earlier one three places up")
+    test.assert_eq(w.top, 103)
+    test.assert_eq(w.mask, 9)
+    srtpindex.accept(var w, 101, 48)
+    test.assert_eq(w.mask, 13)
+    test.case("a jump of 63 keeps the earlier packets in view at the top of the mask")
+    srtpindex.accept(var w, 166, 48)
+    test.assert_eq(w.top, 166)
+    test.assert(not srtpindex.fresh(w, 103, 48))
+    test.assert(srtpindex.fresh(w, 104, 48))
+    test.case("a jump of 64 or more starts the mask again")
+    srtpindex.accept(var w, 230, 48)
+    test.assert_eq(w.mask, 1)
+    test.assert(not srtpindex.fresh(w, 166, 48))
+    test.assert(srtpindex.fresh(w, 167, 48))
+    test.case("an index that is not fresh leaves the window alone")
+    srtpindex.accept(var w, 230, 48)
+    srtpindex.accept(var w, 100, 48)
+    test.assert_eq(w.top, 230)
+    test.assert_eq(w.mask, 1)
+
+@test
+fn test_the_window_is_modular_in_the_width_of_the_index() [io]
+    test.case("SRTCP: the 31-bit index wraps, and 0 is the successor of 2^31 - 1")
+    var w = srtpindex.window_new()
+    srtpindex.accept(var w, 2147483647, 31)
+    test.assert(srtpindex.fresh(w, 0, 31))
+    srtpindex.accept(var w, 0, 31)
+    test.assert_eq(w.top, 0)
+    test.assert_eq(w.mask, 3)
+    test.assert(not srtpindex.fresh(w, 2147483647, 31))
+    test.assert(srtpindex.fresh(w, 2147483646, 31))
+    test.case("SRTP: the 48-bit index wraps the same way")
+    var v = srtpindex.window_new()
+    srtpindex.accept(var v, 281474976710655, 48)
+    test.assert(srtpindex.fresh(v, 0, 48))
+    test.case("an index half the space away counts as below, not above")
+    test.assert(not srtpindex.fresh(after(0), 140737488355328, 48))

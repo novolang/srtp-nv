@@ -1,0 +1,223 @@
+// srtpgcm_tests.nv — AES-GCM over a packet, against the vectors of RFC 7714
+// sections 16 and 17, byte for byte from the RFC's hexadecimal dumps.
+//
+// THE VECTORS ARE PUBLISHED, NOT RECORDED FROM THIS CODE.  Every packet is
+// the one of the RFC and every key, IV and expected result is copied from
+// the dump.  Section 16 is an RTP packet of a 12-byte header and a 38-byte
+// payload under the key 000102...0f (AEAD_AES_128_GCM) and 000102...1f
+// (AEAD_AES_256_GCM) and the IV 51753c6580c2726f20718414: it is encrypted
+// and tagged, decrypted and verified, tagged without encryption, and the
+// tag-only packet verified. Section 17 is an RTCP packet with the E bit
+// and index word 800005d4 when it is encrypted and 000005d4 when it is not;
+// its additional data is the first eight bytes and the word.
+//
+// The tests below the vectors are about what the RFC does not print: a
+// packet changed anywhere is refused, and a refusal changes nothing.
+
+use std.str
+use std.test
+use rtpbytes
+use srtpaes
+use srtpgcm
+
+// The value of a hexadecimal digit, or -1.
+fn hexval(c: Int) -> Int
+    if c >= 48 and c <= 57
+        return c - 48
+    if c >= 97 and c <= 102
+        return c - 87
+    -1
+
+// A packet from a hexadecimal dump, lower case.
+fn pkt_hex(s: Str) -> rtpbytes.RtpBuf
+    var m: rtpbytes.RtpBuf = Vec.new()
+    var hi = -1
+    for i in 0..str.len(s)
+        let v = hexval(str.byte_at_or(s, i, 0))
+        if v >= 0
+            if hi < 0
+                hi = v
+            else
+                let _ = m.push((hi * 16 + v) as u8)
+                hi = -1
+    m
+
+// Key or IV bytes from a hexadecimal dump.
+fn bytes_hex(s: Str) -> srtpaes.SrtpBytes
+    var p = pkt_hex(s)
+    var m: srtpaes.SrtpBytes = Vec.new()
+    for i in 0..p.len()
+        let _ = m.push(p[i])
+    m
+
+fn digit(v: Int) -> Int
+    if v < 10
+        return 48 + v
+    87 + v
+
+// The lower-case hexadecimal of a packet.
+fn hex_of(var d: rtpbytes.RtpBuf) -> Str
+    var s = ""
+    for i in 0..d.len()
+        let b = d[i] as Int
+        s = s + str.from_byte(digit(b >> 4)) + str.from_byte(digit(b & 15))
+    s
+
+fn key128() -> srtpaes.SrtpBytes
+    bytes_hex("000102030405060708090a0b0c0d0e0f")
+
+fn key256() -> srtpaes.SrtpBytes
+    bytes_hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+
+// The IV of every RTP vector: SSRC 5501a0b2, ROC 0, SEQ f17b, XORed with the
+// salt "Quid pro quo".
+fn rtp_iv() -> srtpaes.SrtpBytes
+    bytes_hex("51753c6580c2726f20718414")
+
+// The IV of every RTCP vector: SSRC 4d617273, index 5d4.
+fn rtcp_iv() -> srtpaes.SrtpBytes
+    bytes_hex("517524055203726f207170bb")
+
+fn rtp_plain() -> Str
+    "8040f17b8041f8d35501a0b247616c6c696120657374206f6d6e69732064697669736120696e207061727465732074726573"
+
+fn rtcp_plain() -> Str
+    "81c8000d4d6172734e5450314e545032525450200000042a0000e9304c756e61deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+
+// Seal the RTP packet of section 16 under a key and answer it as hex.
+fn seal_rtp(var raw: srtpaes.SrtpBytes, n: Int, plain: Str, aad: Int) -> Str
+    var gk = srtpgcm.key(var raw, n)
+    var iv = rtp_iv()
+    var p = pkt_hex(plain)
+    test.assert(srtpgcm.seal(var gk, var iv, var p, aad, false, 0, p.len() - aad))
+    hex_of(var p)
+
+@test
+fn test_rfc7714_16_1_aead_aes_128_gcm_on_an_rtp_packet() [io]
+    test.case("16.1.1 the packet is encrypted and tagged")
+    var raw = key128()
+    test.assert_eq(seal_rtp(var raw, 16, rtp_plain(), 12),
+        "8040f17b8041f8d35501a0b2f24de3a3fb34de6cacba861c9d7e4bcabe633bd50d294e6f42a5f47a51c7d19b36de3adf8833899d7f27beb16a9152cf765ee4390cce")
+    test.case("16.1.2 the tagged packet is verified and decrypted")
+    var gk = srtpgcm.key(var raw, 16)
+    var iv = rtp_iv()
+    var p = pkt_hex("8040f17b8041f8d35501a0b2f24de3a3fb34de6cacba861c9d7e4bcabe633bd50d294e6f42a5f47a51c7d19b36de3adf8833899d7f27beb16a9152cf765ee4390cce")
+    test.assert(srtpgcm.open(var gk, var iv, var p, 12, false, 0, 38))
+    test.assert_eq(hex_of(var p), rtp_plain())
+    test.case("16.1.3 the whole packet as additional data gives the tag alone")
+    test.assert_eq(seal_rtp(var raw, 16, rtp_plain(), 50), rtp_plain() + "22493f82d2bce397e9d79e3b19aa4216")
+    test.case("16.1.4 that tag is verified")
+    var q = pkt_hex(rtp_plain() + "22493f82d2bce397e9d79e3b19aa4216")
+    test.assert(srtpgcm.open(var gk, var iv, var q, 50, false, 0, 0))
+    test.assert_eq(hex_of(var q), rtp_plain())
+
+@test
+fn test_rfc7714_16_2_aead_aes_256_gcm_on_an_rtp_packet() [io]
+    test.case("16.2.1 the packet is encrypted and tagged")
+    var raw = key256()
+    test.assert_eq(seal_rtp(var raw, 32, rtp_plain(), 12),
+        "8040f17b8041f8d35501a0b232b1de78a822fe12ef9f78fa332e33aab18012389a58e2f3b50b2a0276ffae0f1ba63799b87b7aa3db36dfffd6b0f9bb7878d7a76c13")
+    test.case("16.2.2 the tagged packet is verified and decrypted")
+    var gk = srtpgcm.key(var raw, 32)
+    var iv = rtp_iv()
+    var p = pkt_hex("8040f17b8041f8d35501a0b232b1de78a822fe12ef9f78fa332e33aab18012389a58e2f3b50b2a0276ffae0f1ba63799b87b7aa3db36dfffd6b0f9bb7878d7a76c13")
+    test.assert(srtpgcm.open(var gk, var iv, var p, 12, false, 0, 38))
+    test.assert_eq(hex_of(var p), rtp_plain())
+    test.case("16.2.3 the whole packet as additional data gives the tag alone")
+    test.assert_eq(seal_rtp(var raw, 32, rtp_plain(), 50), rtp_plain() + "a866d5910f887463067ceefec45215d4")
+    test.case("16.2.4 that tag is verified")
+    var q = pkt_hex(rtp_plain() + "a866d5910f887463067ceefec45215d4")
+    test.assert(srtpgcm.open(var gk, var iv, var q, 50, false, 0, 0))
+
+@test
+fn test_rfc7714_17_srtcp_with_the_e_bit_and_index_in_the_additional_data() [io]
+    var raw = key128()
+    var gk = srtpgcm.key(var raw, 16)
+    var iv = rtcp_iv()
+    test.case("17.1 an RTCP packet is encrypted and tagged; the word follows the tag")
+    var p = pkt_hex(rtcp_plain())
+    test.assert(srtpgcm.seal(var gk, var iv, var p, 8, true, 0x800005d4, p.len() - 8))
+    test.assert_eq(hex_of(var p),
+        "81c8000d4d61727363e94885dcdab67ca727d7662f6b7e997ff5c0f76c06f32dc676a5f1730d6fda4ce09b4686303ded0bb9275bc84aa45896cf4d2fc5abf87245d9eade")
+    test.case("17.1 it is verified and decrypted again")
+    test.assert(srtpgcm.open(var gk, var iv, var p, 8, true, 0x800005d4, p.len() - 8 - 16))
+    test.assert_eq(hex_of(var p), rtcp_plain())
+    test.case("17.3 tagged and not encrypted: the E bit is clear and the plaintext is empty")
+    var t = pkt_hex(rtcp_plain())
+    test.assert(srtpgcm.seal(var gk, var iv, var t, t.len(), true, 0x000005d4, 0))
+    test.assert_eq(hex_of(var t), rtcp_plain() + "841dd9683dd78ec92ae58790125f62b3")
+
+@test
+fn test_rfc7714_17_srtcp_with_aes_256() [io]
+    var raw = key256()
+    var gk = srtpgcm.key(var raw, 32)
+    var iv = rtcp_iv()
+    test.case("17.2 the packet is verified and decrypted to the plaintext of 17.1")
+    var p = pkt_hex("81c8000d4d617273d50ae4d1f5ce5d304ba297e47d470c282c3ece5dbffe0a50a2eaa5c1110555be8415f658c61de0476f1b6fad1d1eb30c4446839f57ff6f6cb26ac3be")
+    test.assert(srtpgcm.open(var gk, var iv, var p, 8, true, 0x800005d4, p.len() - 8 - 16))
+    test.assert_eq(hex_of(var p), rtcp_plain())
+    test.case("17.4 the tag of an unencrypted packet is verified")
+    var q = pkt_hex(rtcp_plain() + "91db4afbfeee5a978fab4393ed2615fe")
+    test.assert(srtpgcm.open(var gk, var iv, var q, q.len() - 16, true, 0x000005d4, 0))
+    test.assert_eq(hex_of(var q), rtcp_plain())
+
+@test
+fn test_a_changed_packet_is_refused_and_left_as_it_was() [io]
+    var raw = key128()
+    var gk = srtpgcm.key(var raw, 16)
+    var iv = rtp_iv()
+    let good = "8040f17b8041f8d35501a0b2f24de3a3fb34de6cacba861c9d7e4bcabe633bd50d294e6f42a5f47a51c7d19b36de3adf8833899d7f27beb16a9152cf765ee4390cce"
+    test.case("a flipped bit in the header")
+    var h = pkt_hex(good)
+    h[1] = 0x41 as u8
+    test.assert(not srtpgcm.open(var gk, var iv, var h, 12, false, 0, 38))
+    test.case("a flipped bit in the cipher")
+    var c = pkt_hex(good)
+    c[20] = (c[20] as Int ^ 1) as u8
+    test.assert(not srtpgcm.open(var gk, var iv, var c, 12, false, 0, 38))
+    test.case("a flipped bit in the last byte of the tag")
+    var t = pkt_hex(good)
+    t[t.len() - 1] = (t[t.len() - 1] as Int ^ 0x80) as u8
+    test.assert(not srtpgcm.open(var gk, var iv, var t, 12, false, 0, 38))
+    test.case("nothing was decrypted or removed by any refusal")
+    test.assert_eq(hex_of(var t), str.slice(good, 0, 2 * (t.len() - 1)) + "4e")
+    test.case("a different IV")
+    var other = bytes_hex("51753c6580c2726f20718415")
+    var d = pkt_hex(good)
+    test.assert(not srtpgcm.open(var gk, var other, var d, 12, false, 0, 38))
+    test.case("the word is part of the additional data")
+    var w = pkt_hex(good)
+    test.assert(not srtpgcm.open(var gk, var iv, var w, 12, true, 1, 38))
+    test.case("a range that does not match the packet is refused")
+    var r = pkt_hex(good)
+    test.assert(not srtpgcm.open(var gk, var iv, var r, 12, false, 0, 37))
+    test.assert(not srtpgcm.open(var gk, var iv, var r, -1, false, 0, 38))
+    test.assert(not srtpgcm.open(var gk, var iv, var r, 12, false, 0, -1))
+
+@test
+fn test_seal_refuses_a_range_outside_the_packet_and_a_full_buffer() [io]
+    var raw = key128()
+    var gk = srtpgcm.key(var raw, 16)
+    var iv = rtp_iv()
+    var p = pkt_hex(rtp_plain())
+    test.case("a range past the end of the packet")
+    test.assert(not srtpgcm.seal(var gk, var iv, var p, 12, false, 0, 39))
+    test.assert(not srtpgcm.seal(var gk, var iv, var p, -1, false, 0, 10))
+    test.assert(not srtpgcm.seal(var gk, var iv, var p, 12, false, 0, -1))
+    test.assert_eq(p.len(), 50)
+    test.case("a buffer with no room for the tag")
+    var full: rtpbytes.RtpBuf = Vec.new()
+    for _i in 0..1485
+        let _ = full.push(1 as u8)
+    test.assert(not srtpgcm.seal(var gk, var iv, var full, 12, false, 0, 10))
+    test.assert_eq(full.len(), 1485)
+    test.assert_eq(full[20] as Int, 1)
+    test.case("a buffer with room for exactly the tag")
+    let _ = full.pop()
+    test.assert(srtpgcm.seal(var gk, var iv, var full, 12, false, 0, 10))
+    test.assert_eq(full.len(), 1500)
+
+@test
+fn test_the_tag_length_and_the_iv_length_are_the_rfc_values() [io]
+    test.assert_eq(srtpgcm.SRTP_GCM_TAG, 16)
+    test.assert_eq(srtpgcm.SRTP_GCM_IV, 12)

@@ -1,0 +1,588 @@
+// srtp_edge_tests.nv — what a packet protection has to refuse, remember and
+// carry, which the vectors of libsrtp and of the RFCs cannot show because they
+// are all about a packet that goes right.
+//
+// WHAT IS ASSERTED FROM THE RFCS.  The replay window of 64 and its rule that
+// the window moves only for an authenticated packet (RFC 3711 section 3.3.2),
+// the roll-over counter (3.3.1), the master key identifier that is sent but
+// not authenticated (3.1), the key derivation rate (4.3.1), the SRTCP index
+// that is zero before the first packet and is not reset (3.4), and the
+// 2^48 and 2^31 packet lifetimes of a master key (9.2).
+//
+// THE KEY DERIVATION RATE has no counterpart in libsrtp.  The packets in
+// `test_a_key_derivation_rate_changes_the_session_keys_at_the_boundary` were
+// made by a second implementation of RFC 3711 sections 4.1.1, 4.2.1 and
+// 4.3.1 to 4.3.3 written in Python from the RFC's text, on the `cryptography`
+// library's AES, which first agreed with libsrtp byte for byte on the packets
+// of the rate 0.  It derives the session keys of `index DIV 4` and protects
+// the packets of AES_CM_128_HMAC_SHA1_80 under master key 000102...0f and
+// master salt a0a1...ad, SSRC 0x11223344.
+
+use std.str
+use std.test
+use rtpbytes
+use srtpaes
+use srtpctx
+use srtp
+
+// The value of a hexadecimal digit, or -1.
+fn hexval(c: Int) -> Int
+    if c >= 48 and c <= 57
+        return c - 48
+    if c >= 97 and c <= 102
+        return c - 87
+    -1
+
+// A packet from a hexadecimal dump, lower case.
+fn pkt_hex(s: Str) -> rtpbytes.RtpBuf
+    var m: rtpbytes.RtpBuf = Vec.new()
+    var hi = -1
+    for i in 0..str.len(s)
+        let v = hexval(str.byte_at_or(s, i, 0))
+        if v >= 0
+            if hi < 0
+                hi = v
+            else
+                let _ = m.push((hi * 16 + v) as u8)
+                hi = -1
+    m
+
+fn digit(v: Int) -> Int
+    if v < 10
+        return 48 + v
+    87 + v
+
+// The lower-case hexadecimal of a packet.
+fn hex_of(var d: rtpbytes.RtpBuf) -> Str
+    var s = ""
+    for i in 0..d.len()
+        let b = d[i] as Int
+        s = s + str.from_byte(digit(b >> 4)) + str.from_byte(digit(b & 15))
+    s
+
+fn profiles() -> [Int]
+    [srtpctx.SRTP_AES128_CM_SHA1_80, srtpctx.SRTP_AES128_CM_SHA1_32, srtpctx.SRTP_AES256_CM_SHA1_80,
+     srtpctx.SRTP_AES256_CM_SHA1_32, srtpctx.SRTP_AEAD_AES128_GCM, srtpctx.SRTP_AEAD_AES256_GCM]
+
+fn master_key(profile: Int) -> srtpaes.SrtpBytes
+    var k: srtpaes.SrtpBytes = Vec.new()
+    for i in 0..srtpctx.key_len(profile)
+        let _ = k.push(i as u8)
+    k
+
+fn master_salt(profile: Int) -> srtpaes.SrtpBytes
+    var s: srtpaes.SrtpBytes = Vec.new()
+    for i in 0..srtpctx.salt_len(profile)
+        let _ = s.push((0xA0 + i) as u8)
+    s
+
+// A context with a key derivation rate.
+fn ctx_kdr(profile: Int, kdr: Int) -> srtpctx.SrtpCtx
+    var c = srtpctx.empty()
+    var k = master_key(profile)
+    var s = master_salt(profile)
+    test.assert_eq(srtpctx.init(var c, profile, var k, var s, kdr), srtpctx.SRTP_OK)
+    c
+
+fn ctx_of(profile: Int) -> srtpctx.SrtpCtx
+    ctx_kdr(profile, 0)
+
+// An RTP packet of sequence number `seq`, SSRC 0x11223344 and `n` payload
+// bytes 0, 1, 2, ...
+fn rtp_pkt(seq: Int, n: Int) -> rtpbytes.RtpBuf
+    var p: rtpbytes.RtpBuf = Vec.new()
+    for b in [0x80, 0x60, seq >> 8, seq & 255, 0, 0, 0, 160, 0x11, 0x22, 0x33, 0x44]
+        let _ = p.push(b as u8)
+    for i in 0..n
+        let _ = p.push((i & 255) as u8)
+    p
+
+// A compound RTCP packet: a sender report header, the SSRC 0x11223344 and
+// `n` bytes of body, a multiple of four.
+fn rtcp_pkt(n: Int) -> rtpbytes.RtpBuf
+    var p: rtpbytes.RtpBuf = Vec.new()
+    for b in [0x81, 0xC8, 0, (8 + n) / 4 - 1, 0x11, 0x22, 0x33, 0x44]
+        let _ = p.push(b as u8)
+    for i in 0..n
+        let _ = p.push((0x40 + i) as u8)
+    p
+
+// The protected form of an RTP packet that is the first a new sender sends.
+fn protected(profile: Int, seq: Int, n: Int) -> rtpbytes.RtpBuf
+    var tx = ctx_of(profile)
+    var p = rtp_pkt(seq, n)
+    test.assert_eq(srtp.protect_rtp(var tx, var p), srtpctx.SRTP_OK)
+    p
+
+// The protected form of an RTCP packet that carries the SRTCP index `index`.
+fn protected_rtcp(profile: Int, index: Int, encrypt: Bool) -> rtpbytes.RtpBuf
+    var tx = ctx_of(profile)
+    test.assert_eq(srtpctx.set_rtcp_index(var tx, index), srtpctx.SRTP_OK)
+    var p = rtcp_pkt(20)
+    test.assert_eq(srtp.protect_rtcp(var tx, var p, encrypt), srtpctx.SRTP_OK)
+    p
+
+// Make the context's highest SRTP index `top`, as if packets had come.
+fn set_top(var c: srtpctx.SrtpCtx, top: Int)
+    c.rtp.started = true
+    c.rtp.top = top
+    c.rtp.mask = 1
+
+// Flip the low bit of byte `at`.
+fn flip(var p: rtpbytes.RtpBuf, at: Int)
+    p[at] = (p[at] as Int ^ 1) as u8
+
+// What an AES-GCM packet adds beyond a zero tag length.
+fn srtpgcm_extra(profile: Int) -> Int
+    if srtpctx.is_gcm(profile)
+        return 16
+    0
+
+// Where the word of the E bit and the index is in a protected RTCP packet of
+// `len` bytes: before the tag for AES-CM, last for AES-GCM.
+fn word_pos(profile: Int, len: Int) -> Int
+    if srtpctx.is_gcm(profile)
+        return len - 4
+    len - 10 - 4
+
+@test
+fn test_every_profile_round_trips_and_adds_what_its_tag_is() [io]
+    for profile in profiles()
+        var tx = ctx_of(profile)
+        var rx = ctx_of(profile)
+        test.case("a run of packets of different lengths, including an empty payload")
+        for k in 0..4
+            let n = k * 37
+            var p = rtp_pkt(100 + k, n)
+            test.assert_eq(srtp.protect_rtp(var tx, var p), srtpctx.SRTP_OK)
+            var extra = srtpctx.rtp_tag_len(profile)
+            if srtpctx.is_gcm(profile)
+                extra = 16
+            test.assert_eq(p.len(), 12 + n + extra)
+            test.assert_eq(srtp.unprotect_rtp(var rx, var p), srtpctx.SRTP_OK)
+            var want = rtp_pkt(100 + k, n)
+            test.assert_eq(hex_of(var p), hex_of(var want))
+        test.case("the payload is encrypted: it differs from the plain payload")
+        var q = rtp_pkt(200, 32)
+        test.assert_eq(srtp.protect_rtp(var tx, var q), srtpctx.SRTP_OK)
+        var plain = rtp_pkt(200, 32)
+        var same = 0
+        for i in 12..44
+            if q[i] == plain[i]
+                same = same + 1
+        test.assert(same < 8)
+
+@test
+fn test_the_length_of_an_rtp_header() [io]
+    test.case("twelve bytes, and then a CSRC list of two, and then an extension of three words")
+    var a = rtp_pkt(1, 5)
+    test.assert_eq(srtp.header_len(var a), 12)
+    var b: rtpbytes.RtpBuf = Vec.new()
+    for x in [0x82, 0x60, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 7, 0, 0, 0, 8, 9]
+        let _ = b.push(x as u8)
+    test.assert_eq(srtp.header_len(var b), 20)
+    var c: rtpbytes.RtpBuf = Vec.new()
+    for x in [0x90, 0x60, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0xBE, 0xDE, 0, 3, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 9]
+        let _ = c.push(x as u8)
+    test.assert_eq(srtp.header_len(var c), 28)
+    test.case("fewer than twelve bytes")
+    var d = pkt_hex("800000010000000000")
+    test.assert_eq(srtp.header_len(var d), -1)
+    test.case("version 1")
+    var e = rtp_pkt(1, 0)
+    e[0] = 0x40 as u8
+    test.assert_eq(srtp.header_len(var e), -1)
+    test.case("a CSRC list that runs past the end")
+    var f = rtp_pkt(1, 3)
+    f[0] = 0x8F as u8
+    test.assert_eq(srtp.header_len(var f), -1)
+    test.case("an extension header that does not fit")
+    var g = rtp_pkt(1, 2)
+    g[0] = 0x90 as u8
+    test.assert_eq(srtp.header_len(var g), -1)
+    test.case("an extension that runs past the end")
+    var h = rtp_pkt(1, 6)
+    h[0] = 0x90 as u8
+    h[14] = 0 as u8
+    h[15] = 9 as u8
+    test.assert_eq(srtp.header_len(var h), -1)
+
+@test
+fn test_protect_rtp_refuses_what_it_cannot_protect() [io]
+    test.case("a context with no profile")
+    var none = srtpctx.empty()
+    var p = rtp_pkt(1, 4)
+    test.assert_eq(srtp.protect_rtp(var none, var p), srtpctx.SRTP_ERR_ARGUMENT)
+    test.assert_eq(p.len(), 16)
+    var c = ctx_of(srtpctx.SRTP_AES128_CM_SHA1_80)
+    test.case("a packet that is not RTP")
+    var short = pkt_hex("8000")
+    test.assert_eq(srtp.protect_rtp(var c, var short), srtpctx.SRTP_ERR_BAD_PACKET)
+    test.assert_eq(short.len(), 2)
+    test.case("no room for the tag: 1491 bytes and a tag of 10 do not fit in 1500, 1490 do")
+    var big = rtp_pkt(1, 1479)
+    test.assert_eq(big.len(), 1491)
+    test.assert_eq(srtp.protect_rtp(var c, var big), srtpctx.SRTP_ERR_NO_ROOM)
+    test.assert_eq(big.len(), 1491)
+    var fits = rtp_pkt(1, 1478)
+    test.assert_eq(srtp.protect_rtp(var c, var fits), srtpctx.SRTP_OK)
+    test.assert_eq(fits.len(), 1500)
+    test.case("no room for the master key identifier either")
+    var m = ctx_of(srtpctx.SRTP_AES128_CM_SHA1_80)
+    test.assert_eq(srtpctx.set_mki(var m, 4, 7), srtpctx.SRTP_OK)
+    var tight = rtp_pkt(1, 1475)
+    test.assert_eq(srtp.protect_rtp(var m, var tight), srtpctx.SRTP_ERR_NO_ROOM)
+    test.case("an index that was protected before is refused, because it would reuse a keystream")
+    var again = rtp_pkt(1, 4)
+    test.assert_eq(srtp.protect_rtp(var c, var again), srtpctx.SRTP_ERR_REPLAY)
+    test.assert_eq(again.len(), 16)
+    test.case("a master key that has protected 2^48 packets protects no more")
+    var worn = ctx_of(srtpctx.SRTP_AEAD_AES128_GCM)
+    set_top(var worn, srtp.SRTP_INDEX_MAX - 1)
+    var last = rtp_pkt(0xFFFF, 4)
+    test.assert_eq(srtp.protect_rtp(var worn, var last), srtpctx.SRTP_ERR_KEY_LIFE)
+
+@test
+fn test_unprotect_rtp_refuses_what_it_cannot_accept() [io]
+    test.case("a context with no profile")
+    var none = srtpctx.empty()
+    var p = rtp_pkt(1, 4)
+    test.assert_eq(srtp.unprotect_rtp(var none, var p), srtpctx.SRTP_ERR_ARGUMENT)
+    for profile in profiles()
+        var rx = ctx_of(profile)
+        test.case("a packet shorter than its header and its tag")
+        var short = protected(profile, 5, 0)
+        let _ = short.pop()
+        test.assert_eq(srtp.unprotect_rtp(var rx, var short), srtpctx.SRTP_ERR_BAD_PACKET)
+        var junk = pkt_hex("00112233445566778899")
+        test.assert_eq(srtp.unprotect_rtp(var rx, var junk), srtpctx.SRTP_ERR_BAD_PACKET)
+        test.case("a flipped bit in the header, the payload and the last byte of the tag")
+        var good = protected(profile, 5, 20)
+        let last = good.len() - 1
+        for at in [1, 14, last]
+            var bad = protected(profile, 5, 20)
+            flip(var bad, at)
+            var before = hex_of(var bad)
+            test.assert_eq(srtp.unprotect_rtp(var rx, var bad), srtpctx.SRTP_ERR_AUTH)
+            test.assert_eq(hex_of(var bad), before)
+        test.case("the forged packets did not move the window: the genuine one is accepted")
+        test.assert_eq(srtp.unprotect_rtp(var rx, var good), srtpctx.SRTP_OK)
+        test.case("and then it is a replay")
+        var twice = protected(profile, 5, 20)
+        test.assert_eq(srtp.unprotect_rtp(var rx, var twice), srtpctx.SRTP_ERR_REPLAY)
+        test.assert_eq(twice.len(), 12 + 20 + srtpctx.rtp_tag_len(profile) + srtpgcm_extra(profile))
+
+@test
+fn test_the_replay_window_is_64_and_slides_only_forward() [io]
+    for profile in profiles()
+        var rx = ctx_of(profile)
+        test.case("packet 70 first: a late packet inside the window is accepted once")
+        var p70 = protected(profile, 70, 8)
+        test.assert_eq(srtp.unprotect_rtp(var rx, var p70), srtpctx.SRTP_OK)
+        var p69 = protected(profile, 69, 8)
+        test.assert_eq(srtp.unprotect_rtp(var rx, var p69), srtpctx.SRTP_OK)
+        var p69b = protected(profile, 69, 8)
+        test.assert_eq(srtp.unprotect_rtp(var rx, var p69b), srtpctx.SRTP_ERR_REPLAY)
+        test.case("70 - 7 = 63 is the oldest index inside the window, 70 - 6 = 64 is below it")
+        var p7 = protected(profile, 7, 8)
+        test.assert_eq(srtp.unprotect_rtp(var rx, var p7), srtpctx.SRTP_OK)
+        var p6 = protected(profile, 6, 8)
+        test.assert_eq(srtp.unprotect_rtp(var rx, var p6), srtpctx.SRTP_ERR_REPLAY)
+        test.case("a jump of 64 or more empties the window")
+        var p200 = protected(profile, 200, 8)
+        test.assert_eq(srtp.unprotect_rtp(var rx, var p200), srtpctx.SRTP_OK)
+        var p140 = protected(profile, 140, 8)
+        test.assert_eq(srtp.unprotect_rtp(var rx, var p140), srtpctx.SRTP_OK)
+        var p70b = protected(profile, 70, 8)
+        test.assert_eq(srtp.unprotect_rtp(var rx, var p70b), srtpctx.SRTP_ERR_REPLAY)
+
+@test
+fn test_the_master_key_identifier_is_carried_and_not_authenticated() [io]
+    test.case("AES-CM: the identifier sits between the encrypted payload and the tag")
+    var plain = ctx_of(srtpctx.SRTP_AES128_CM_SHA1_80)
+    var withmki = ctx_of(srtpctx.SRTP_AES128_CM_SHA1_80)
+    test.assert_eq(srtpctx.set_mki(var withmki, 4, 0x01020304), srtpctx.SRTP_OK)
+    var a = rtp_pkt(9, 10)
+    var b = rtp_pkt(9, 10)
+    test.assert_eq(srtp.protect_rtp(var plain, var a), srtpctx.SRTP_OK)
+    test.assert_eq(srtp.protect_rtp(var withmki, var b), srtpctx.SRTP_OK)
+    let n = a.len()
+    test.assert_eq(b.len(), n + 4)
+    test.assert_eq(str.slice(hex_of(var b), 0, 2 * (n - 10)), str.slice(hex_of(var a), 0, 2 * (n - 10)))
+    test.assert_eq(str.slice(hex_of(var b), 2 * (n - 10), 2 * (n - 10) + 8), "01020304")
+    test.assert_eq(str.slice(hex_of(var b), 2 * (n - 10) + 8, 2 * n + 8),
+        str.slice(hex_of(var a), 2 * (n - 10), 2 * n))
+    test.case("a receiver reads the identifier and checks it")
+    test.assert_eq(srtp.packet_mki(var withmki, var b, false), 0x01020304)
+    var rx = ctx_of(srtpctx.SRTP_AES128_CM_SHA1_80)
+    test.assert_eq(srtpctx.set_mki(var rx, 4, 0x01020305), srtpctx.SRTP_OK)
+    test.assert_eq(srtp.unprotect_rtp(var rx, var b), srtpctx.SRTP_ERR_MKI)
+    var ok = ctx_of(srtpctx.SRTP_AES128_CM_SHA1_80)
+    test.assert_eq(srtpctx.set_mki(var ok, 4, 0x01020304), srtpctx.SRTP_OK)
+    test.assert_eq(srtp.unprotect_rtp(var ok, var b), srtpctx.SRTP_OK)
+    var want = rtp_pkt(9, 10)
+    test.assert_eq(hex_of(var b), hex_of(var want))
+    test.case("a context with no identifier reads -1, and so does a packet too short for one")
+    test.assert_eq(srtp.packet_mki(var plain, var a, false), -1)
+    var tiny = pkt_hex("0102")
+    test.assert_eq(srtp.packet_mki(var withmki, var tiny, false), -1)
+    test.case("AES-GCM: the identifier follows the tag, and a packet refused for its tag keeps it")
+    var g = ctx_of(srtpctx.SRTP_AEAD_AES128_GCM)
+    test.assert_eq(srtpctx.set_mki(var g, 2, 0x0102), srtpctx.SRTP_OK)
+    var gp = rtp_pkt(3, 6)
+    test.assert_eq(srtp.protect_rtp(var g, var gp), srtpctx.SRTP_OK)
+    test.assert_eq(gp.len(), 12 + 6 + 16 + 2)
+    test.assert_eq(srtp.packet_mki(var g, var gp, false), 0x0102)
+    var gr = ctx_of(srtpctx.SRTP_AEAD_AES128_GCM)
+    test.assert_eq(srtpctx.set_mki(var gr, 2, 0x0102), srtpctx.SRTP_OK)
+    flip(var gp, 14)
+    var snap = hex_of(var gp)
+    test.assert_eq(srtp.unprotect_rtp(var gr, var gp), srtpctx.SRTP_ERR_AUTH)
+    test.assert_eq(hex_of(var gp), snap)
+    flip(var gp, 14)
+    test.assert_eq(srtp.unprotect_rtp(var gr, var gp), srtpctx.SRTP_OK)
+
+@test
+fn test_a_key_derivation_rate_changes_the_session_keys_at_the_boundary() [io]
+    var tx = ctx_kdr(srtpctx.SRTP_AES128_CM_SHA1_80, 4)
+    var rx = ctx_kdr(srtpctx.SRTP_AES128_CM_SHA1_80, 4)
+    test.case("packets 3, 4, 5, 8 and 9: the quotients index DIV 4 are 0, 1, 1, 2, 2")
+    var p3 = pkt_hex("80000003000000a011223344030405060708090a0b")
+    test.assert_eq(srtp.protect_rtp(var tx, var p3), srtpctx.SRTP_OK)
+    test.assert_eq(hex_of(var p3), "80000003000000a0112233443c28895f37fbdc2b777861e259471c9e055104")
+    var p4 = pkt_hex("80000004000000a0112233440405060708090a0b0c")
+    test.assert_eq(srtp.protect_rtp(var tx, var p4), srtpctx.SRTP_OK)
+    test.assert_eq(hex_of(var p4), "80000004000000a011223344bbb3bb7984ae619bd233e528801ff6e144596f")
+    var p5 = pkt_hex("80000005000000a01122334405060708090a0b0c0d")
+    test.assert_eq(srtp.protect_rtp(var tx, var p5), srtpctx.SRTP_OK)
+    test.assert_eq(hex_of(var p5), "80000005000000a011223344c1237622b387a6bc56ffa96126c1f70cc04d51")
+    var p8 = pkt_hex("80000008000000a01122334408090a0b0c0d0e0f10")
+    test.assert_eq(srtp.protect_rtp(var tx, var p8), srtpctx.SRTP_OK)
+    test.assert_eq(hex_of(var p8), "80000008000000a01122334465d4a98bcbfb7467871091f233602803258f16")
+    var p9 = pkt_hex("80000009000000a011223344090a0b0c0d0e0f1011")
+    test.assert_eq(srtp.protect_rtp(var tx, var p9), srtpctx.SRTP_OK)
+    test.assert_eq(hex_of(var p9), "80000009000000a011223344bc1dc97050ec0523d72055fb6a9444362b7e59")
+    test.case("a receiver takes them out of order across two boundaries")
+    test.assert_eq(srtp.unprotect_rtp(var rx, var p9), srtpctx.SRTP_OK)
+    test.assert_eq(srtp.unprotect_rtp(var rx, var p5), srtpctx.SRTP_OK)
+    var p3b = pkt_hex("80000003000000a0112233443c28895f37fbdc2b777861e259471c9e055104")
+    test.assert_eq(srtp.unprotect_rtp(var rx, var p3b), srtpctx.SRTP_OK)
+    test.assert_eq(hex_of(var p3b), "80000003000000a011223344030405060708090a0b")
+    test.assert_eq(srtp.unprotect_rtp(var rx, var p4), srtpctx.SRTP_OK)
+    test.case("the same packet protected with the rate 0 is not the packet of the rate 4")
+    var flat = ctx_of(srtpctx.SRTP_AES128_CM_SHA1_80)
+    var f4 = pkt_hex("80000004000000a0112233440405060708090a0b0c")
+    test.assert_eq(srtp.protect_rtp(var flat, var f4), srtpctx.SRTP_OK)
+    test.assert(hex_of(var f4) != "80000004000000a011223344bbb3bb7984ae619bd233e528801ff6e144596f")
+    test.case("the packets of the first quotient are the same under the rate 0")
+    var f3 = pkt_hex("80000003000000a011223344030405060708090a0b")
+    test.assert_eq(srtp.protect_rtp(var flat, var f3), srtpctx.SRTP_OK)
+    test.assert_eq(hex_of(var f3), "80000003000000a0112233443c28895f37fbdc2b777861e259471c9e055104")
+
+@test
+fn test_srtcp_session_keys_follow_the_rate_too() [io]
+    var tx = ctx_kdr(srtpctx.SRTP_AES128_CM_SHA1_80, 4)
+    var rx = ctx_kdr(srtpctx.SRTP_AES128_CM_SHA1_80, 4)
+    test.case("SRTCP indices 3, 4 and 9 use the quotients 0, 1 and 2")
+    for k in 0..3
+        test.assert_eq(srtpctx.set_rtcp_index(var tx, [3, 4, 9][k]), srtpctx.SRTP_OK)
+        var p = rtcp_pkt(20)
+        test.assert_eq(srtp.protect_rtcp(var tx, var p, true), srtpctx.SRTP_OK)
+        test.assert_eq(hex_of(var p), ["81c8000611223344d4e40ef1895207f6779dad4f32913cf45dab09f78000000368663b13f233a1574e00",
+            "81c8000611223344d5066a68152a70a3724cdfb2b48fd06ff70ee41b80000004b76d999727b38d43cee1",
+            "81c80006112233448b6ce7a11684135f5d4a64125329692eb565015780000009ce2fb6f10eb6e5d014b8"][k])
+        test.assert_eq(srtp.unprotect_rtcp(var rx, var p), srtpctx.SRTP_OK)
+        var want = rtcp_pkt(20)
+        test.assert_eq(hex_of(var p), hex_of(var want))
+
+@test
+fn test_srtcp_every_profile_encrypted_and_authenticated_only() [io]
+    for profile in profiles()
+        var tx = ctx_of(profile)
+        var rx = ctx_of(profile)
+        test.case("the first packet carries the index 0 and the next 1, and the counter is readable")
+        test.assert_eq(srtpctx.rtcp_index(tx), 0)
+        var a = rtcp_pkt(20)
+        test.assert_eq(srtp.protect_rtcp(var tx, var a, true), srtpctx.SRTP_OK)
+        test.assert_eq(srtpctx.rtcp_index(tx), 1)
+        var tl = srtpctx.rtcp_tag_len(profile)
+        if srtpctx.is_gcm(profile)
+            tl = 16
+        test.assert_eq(a.len(), 28 + 4 + tl)
+        let at = word_pos(profile, a.len())
+        test.assert_eq(str.slice(hex_of(var a), 2 * at, 2 * at + 8), "80000000")
+        test.assert_eq(srtp.unprotect_rtcp(var rx, var a), srtpctx.SRTP_OK)
+        var want = rtcp_pkt(20)
+        test.assert_eq(hex_of(var a), hex_of(var want))
+        var b = rtcp_pkt(20)
+        test.assert_eq(srtp.protect_rtcp(var tx, var b, false), srtpctx.SRTP_OK)
+        let bt = word_pos(profile, b.len())
+        test.assert_eq(str.slice(hex_of(var b), 2 * bt, 2 * bt + 8), "00000001")
+        test.case("without the E bit the packet is readable in the protected form")
+        test.assert_eq(str.slice(hex_of(var b), 0, 56), str.slice(hex_of(var want), 0, 56))
+        test.assert_eq(srtp.unprotect_rtcp(var rx, var b), srtpctx.SRTP_OK)
+        test.assert_eq(hex_of(var b), hex_of(var want))
+
+@test
+fn test_srtcp_refusals() [io]
+    test.case("a context with no profile")
+    var none = srtpctx.empty()
+    var n1 = rtcp_pkt(8)
+    test.assert_eq(srtp.protect_rtcp(var none, var n1, true), srtpctx.SRTP_ERR_ARGUMENT)
+    test.assert_eq(srtp.unprotect_rtcp(var none, var n1), srtpctx.SRTP_ERR_ARGUMENT)
+    for profile in profiles()
+        var rx = ctx_of(profile)
+        var tx = ctx_of(profile)
+        test.case("a packet that is not RTCP: too short, and version 1")
+        var short = pkt_hex("81c8")
+        test.assert_eq(srtp.protect_rtcp(var tx, var short, true), srtpctx.SRTP_ERR_BAD_PACKET)
+        var v1 = rtcp_pkt(8)
+        v1[0] = 0x41 as u8
+        test.assert_eq(srtp.protect_rtcp(var tx, var v1, true), srtpctx.SRTP_ERR_BAD_PACKET)
+        test.assert_eq(srtp.unprotect_rtcp(var rx, var v1), srtpctx.SRTP_ERR_BAD_PACKET)
+        var tiny = pkt_hex("81c80001112233440000")
+        test.assert_eq(srtp.unprotect_rtcp(var rx, var tiny), srtpctx.SRTP_ERR_BAD_PACKET)
+        test.case("a flipped bit in the header, the body, the index word and the tag")
+        for enc in [true, false]
+            var rx2 = ctx_of(profile)
+            var good = protected_rtcp(profile, 1, enc)
+            var tag_at = good.len() - 1
+            if srtpctx.is_gcm(profile)
+                tag_at = good.len() - 5
+            for at in [1, 12, word_pos(profile, good.len()), tag_at]
+                var bad = protected_rtcp(profile, 1, enc)
+                flip(var bad, at)
+                var before = hex_of(var bad)
+                test.assert_eq(srtp.unprotect_rtcp(var rx2, var bad), srtpctx.SRTP_ERR_AUTH)
+                test.assert_eq(hex_of(var bad), before)
+            test.case("the forged packets did not move the window: the genuine one is accepted, once")
+            test.assert_eq(srtp.unprotect_rtcp(var rx2, var good), srtpctx.SRTP_OK)
+            var again = protected_rtcp(profile, 1, enc)
+            test.assert_eq(srtp.unprotect_rtcp(var rx2, var again), srtpctx.SRTP_ERR_REPLAY)
+        test.case("no room for the tag, the index word and the identifier")
+        var m = ctx_of(profile)
+        test.assert_eq(srtpctx.set_mki(var m, 4, 1), srtpctx.SRTP_OK)
+        var big = rtcp_pkt(1480)
+        test.assert_eq(srtp.protect_rtcp(var m, var big, true), srtpctx.SRTP_ERR_NO_ROOM)
+        test.assert_eq(big.len(), 1488)
+        test.case("a master key that has protected 2^31 packets protects no more")
+        test.assert_eq(srtpctx.set_rtcp_index(var tx, 2147483647), srtpctx.SRTP_OK)
+        var last = rtcp_pkt(8)
+        test.assert_eq(srtp.protect_rtcp(var tx, var last, true), srtpctx.SRTP_OK)
+        var past = rtcp_pkt(8)
+        test.assert_eq(srtp.protect_rtcp(var tx, var past, true), srtpctx.SRTP_ERR_KEY_LIFE)
+
+@test
+fn test_srtcp_with_a_master_key_identifier() [io]
+    for profile in [srtpctx.SRTP_AES128_CM_SHA1_80, srtpctx.SRTP_AEAD_AES256_GCM]
+        var tx = ctx_of(profile)
+        var rx = ctx_of(profile)
+        test.assert_eq(srtpctx.set_mki(var tx, 3, 0x010203), srtpctx.SRTP_OK)
+        test.assert_eq(srtpctx.set_mki(var rx, 3, 0x010203), srtpctx.SRTP_OK)
+        var p = rtcp_pkt(12)
+        test.assert_eq(srtp.protect_rtcp(var tx, var p, true), srtpctx.SRTP_OK)
+        test.assert_eq(srtp.packet_mki(var tx, var p, true), 0x010203)
+        test.case("a receiver with another identifier refuses the packet")
+        var other = ctx_of(profile)
+        test.assert_eq(srtpctx.set_mki(var other, 3, 0x010204), srtpctx.SRTP_OK)
+        test.assert_eq(srtp.unprotect_rtcp(var other, var p), srtpctx.SRTP_ERR_MKI)
+        test.case("a refusal for the tag leaves the packet whole, identifier included")
+        flip(var p, 10)
+        var before = hex_of(var p)
+        test.assert_eq(srtp.unprotect_rtcp(var rx, var p), srtpctx.SRTP_ERR_AUTH)
+        test.assert_eq(hex_of(var p), before)
+        flip(var p, 10)
+        test.assert_eq(srtp.unprotect_rtcp(var rx, var p), srtpctx.SRTP_OK)
+        var want = rtcp_pkt(12)
+        test.assert_eq(hex_of(var p), hex_of(var want))
+
+@test
+fn test_a_context_is_set_up_from_a_profile_a_key_and_a_salt() [io]
+    test.case("the table of profiles")
+    for pair in [[1, 16, 14, 10, 10],
+    [2, 16, 14, 4, 10],
+    [3, 32, 14, 10, 10],
+    [4, 32, 14, 4, 10],
+    [7, 16, 12, 0, 0],
+    [8, 32, 12, 0, 0]]
+        test.assert(srtpctx.profile_ok(pair[0]))
+        test.assert_eq(srtpctx.key_len(pair[0]), pair[1])
+        test.assert_eq(srtpctx.salt_len(pair[0]), pair[2])
+        test.assert_eq(srtpctx.rtp_tag_len(pair[0]), pair[3])
+        test.assert_eq(srtpctx.rtcp_tag_len(pair[0]), pair[4])
+        test.assert_eq(srtpctx.is_gcm(pair[0]), pair[0] >= 7)
+    test.assert(not srtpctx.profile_ok(0))
+    test.assert(not srtpctx.profile_ok(5))
+    test.assert(not srtpctx.profile_ok(9))
+    test.case("a key or a salt of the wrong length, an unknown profile, and a bad rate are refused")
+    var k16 = master_key(1)
+    var k32 = master_key(3)
+    var s14 = master_salt(1)
+    var s12 = master_salt(7)
+    var c = srtpctx.empty()
+    test.assert_eq(srtpctx.init(var c, 1, var k32, var s14, 0), srtpctx.SRTP_ERR_ARGUMENT)
+    test.assert_eq(srtpctx.init(var c, 1, var k16, var s12, 0), srtpctx.SRTP_ERR_ARGUMENT)
+    test.assert_eq(srtpctx.init(var c, 7, var k16, var s14, 0), srtpctx.SRTP_ERR_ARGUMENT)
+    test.assert_eq(srtpctx.init(var c, 5, var k16, var s14, 0), srtpctx.SRTP_ERR_ARGUMENT)
+    test.assert_eq(srtpctx.init(var c, 1, var k16, var s14, 3), srtpctx.SRTP_ERR_ARGUMENT)
+    test.assert_eq(srtpctx.init(var c, 1, var k16, var s14, -4), srtpctx.SRTP_ERR_ARGUMENT)
+    test.assert_eq(srtpctx.init(var c, 1, var k16, var s14, 33554432), srtpctx.SRTP_ERR_ARGUMENT)
+    test.assert_eq(c.profile, 0)
+    test.case("the rates 0, 1 and 2^24 are accepted")
+    test.assert_eq(srtpctx.init(var c, 1, var k16, var s14, 1), srtpctx.SRTP_OK)
+    test.assert_eq(srtpctx.init(var c, 1, var k16, var s14, 16777216), srtpctx.SRTP_OK)
+    test.assert_eq(c.kdr, 16777216)
+    test.case("the master key identifier is 0 to 8 bytes and the value fits")
+    test.assert_eq(srtpctx.set_mki(var c, 0, 0), srtpctx.SRTP_OK)
+    test.assert_eq(srtpctx.set_mki(var c, 8, 5), srtpctx.SRTP_OK)
+    test.assert_eq(srtpctx.set_mki(var c, 1, 255), srtpctx.SRTP_OK)
+    test.assert_eq(srtpctx.set_mki(var c, 1, 256), srtpctx.SRTP_ERR_ARGUMENT)
+    test.assert_eq(srtpctx.set_mki(var c, 0, 1), srtpctx.SRTP_ERR_ARGUMENT)
+    test.assert_eq(srtpctx.set_mki(var c, 9, 1), srtpctx.SRTP_ERR_ARGUMENT)
+    test.assert_eq(srtpctx.set_mki(var c, -1, 1), srtpctx.SRTP_ERR_ARGUMENT)
+    test.assert_eq(srtpctx.set_mki(var c, 4, -1), srtpctx.SRTP_ERR_ARGUMENT)
+    test.case("the SRTCP index is set to 0 through 2^31 - 1, and carried over a re-key")
+    test.assert_eq(srtpctx.set_rtcp_index(var c, 41), srtpctx.SRTP_OK)
+    test.assert_eq(srtpctx.rtcp_index(c), 41)
+    test.assert_eq(srtpctx.set_rtcp_index(var c, -1), srtpctx.SRTP_ERR_ARGUMENT)
+    test.assert_eq(srtpctx.set_rtcp_index(var c, 2147483648), srtpctx.SRTP_ERR_ARGUMENT)
+    test.assert_eq(srtpctx.rtcp_index(c), 41)
+
+@test
+fn test_the_initialisation_vectors_put_the_ssrc_and_the_index_in_place() [io]
+    test.case("AES-CM: salt * 2^16 XOR SSRC * 2^64 XOR index * 2^16, the SSRC at bytes 4 to 7 and the index at 8 to 13")
+    var salt: srtpaes.SrtpBytes = Vec.new()
+    for i in 0..14
+        let _ = salt.push((0x10 + i) as u8)
+    let b = srtpctx.iv_cm(var salt, 0x01020304, 0x0A0B0C0D0E0F)
+    var got = ""
+    for i in 0..16
+        got = got + str.from_int(srtpaes.block_byte(b, i)) + " "
+    test.assert_eq(got, "16 17 18 19 21 23 21 19 18 18 22 22 18 18 0 0 ")
+    test.case("AES-GCM: two zero bytes, the SSRC, the 48-bit index, XOR the 12-byte salt; the RFC 7714 example")
+    var gs: srtpaes.SrtpBytes = Vec.new()
+    for x in [0x51, 0x75, 0x69, 0x64, 0x20, 0x70, 0x72, 0x6f, 0x20, 0x71, 0x75, 0x6f]
+        let _ = gs.push(x as u8)
+    var iv: srtpaes.SrtpBytes = Vec.new()
+    srtpctx.iv_gcm(var gs, 0x5501a0b2, 0xf17b, var iv)
+    var s = ""
+    for i in 0..iv.len()
+        s = s + str.from_int(iv[i] as Int) + " "
+    test.assert_eq(s, "81 117 60 101 128 194 114 111 32 113 132 20 ")
+
+@test
+fn test_ensure_keys_derives_again_only_when_the_quotient_changes() [io]
+    var c = ctx_kdr(srtpctx.SRTP_AES128_CM_SHA1_80, 4)
+    test.assert_eq(c.rtp_r, 0)
+    test.assert_eq(c.rtcp_r, 0)
+    srtpctx.ensure_keys(var c, false, 3)
+    test.assert_eq(c.rtp_r, 0)
+    srtpctx.ensure_keys(var c, false, 9)
+    test.assert_eq(c.rtp_r, 2)
+    test.assert_eq(c.rtcp_r, 0)
+    srtpctx.ensure_keys(var c, true, 13)
+    test.assert_eq(c.rtcp_r, 3)
+    test.case("with the rate 0 the session keys are those of the context's setup and stay")
+    var flat = ctx_of(srtpctx.SRTP_AES128_CM_SHA1_80)
+    srtpctx.ensure_keys(var flat, false, 100000)
+    test.assert_eq(flat.rtp_r, 0)

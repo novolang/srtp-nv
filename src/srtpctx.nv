@@ -1,0 +1,370 @@
+// srtpctx.nv — the cryptographic context of RFC 3711 section 3.2: the
+// protection profile, the master key and salt, the session keys derived from
+// them, and the state of one stream.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it, and no allocation.  A
+// context is a `@value` struct of about two kilobytes that the caller holds
+// in a `var`: the expanded master key, the session keys for SRTP and for
+// SRTCP, the replay windows and the counters.
+//
+// ONE CONTEXT IS ONE DIRECTION OF ONE STREAM.  RFC 3711 keeps a context per
+// SSRC, because the ROC, the highest sequence number and the replay list
+// belong to a source.  A sender holds one context for the SSRC it sends. A
+// receiver holds one for each SSRC it accepts, each initialised from the
+// same master key when the key management gives a master key to the session.
+// DTLS-SRTP (`srtpdtls`) gives each direction its own master key.
+//
+// THE PROFILES are the sets of algorithms a key management protocol names.
+// The four counter-mode profiles use AES-CM and HMAC-SHA1 (RFC 3711, with
+// the 256-bit key of RFC 6188); the two GCM profiles use AEAD_AES_128_GCM and
+// AEAD_AES_256_GCM (RFC 7714) and carry their 16-byte tag inside the cipher.
+//
+//     profile                    key   salt  RTP tag  RTCP tag
+//     AES_CM_128_HMAC_SHA1_80     16    14    10       10
+//     AES_CM_128_HMAC_SHA1_32     16    14     4       10
+//     AES_CM_256_HMAC_SHA1_80     32    14    10       10
+//     AES_CM_256_HMAC_SHA1_32     32    14     4       10
+//     AEAD_AES_128_GCM            16    12    16       16
+//     AEAD_AES_256_GCM            32    12    16       16
+//
+// The `_32` profiles cut the tag of an RTP packet to 32 bits and keep the
+// 80-bit tag for RTCP (RFC 5764 section 4.1.2).
+//
+// SESSION KEYS are derived from the master key (`srtpkdf`).  With a key
+// derivation rate of zero they are derived once.  With a rate of `2^n` they
+// change whenever `index DIV rate` does, and the context derives the keys
+// again for the packet whose quotient is not the one it holds.
+
+use aes_core
+use ghash_core
+use srtpaes
+use srtpgcm
+use srtpindex
+use srtpkdf
+use srtpmac
+
+// The call succeeded.
+pub const SRTP_OK = 0
+// A profile, key, salt or other argument is not one this package accepts.
+pub const SRTP_ERR_ARGUMENT = 1
+// The packet is too short or its header is not a header.
+pub const SRTP_ERR_BAD_PACKET = 2
+// The buffer has no room for what protection adds.
+pub const SRTP_ERR_NO_ROOM = 3
+// The authentication tag does not match.
+pub const SRTP_ERR_AUTH = 4
+// The packet's index was received before, or is below the replay window.
+pub const SRTP_ERR_REPLAY = 5
+// The master key identifier of the packet is not the context's.
+pub const SRTP_ERR_MKI = 6
+// The master key has protected as many packets as RFC 3711 allows.
+pub const SRTP_ERR_KEY_LIFE = 7
+
+// Profile: AES_CM_128_HMAC_SHA1_80, 1 (the DTLS-SRTP profile number).
+pub const SRTP_AES128_CM_SHA1_80 = 1
+// Profile: AES_CM_128_HMAC_SHA1_32, 2 (the DTLS-SRTP profile number).
+pub const SRTP_AES128_CM_SHA1_32 = 2
+// Profile: AES_CM_256_HMAC_SHA1_80, 3.  No DTLS-SRTP registry number exists.
+pub const SRTP_AES256_CM_SHA1_80 = 3
+// Profile: AES_CM_256_HMAC_SHA1_32, 4.  No DTLS-SRTP registry number exists.
+pub const SRTP_AES256_CM_SHA1_32 = 4
+// Profile: AEAD_AES_128_GCM, 7 (the DTLS-SRTP profile number).
+pub const SRTP_AEAD_AES128_GCM = 7
+// Profile: AEAD_AES_256_GCM, 8 (the DTLS-SRTP profile number).
+pub const SRTP_AEAD_AES256_GCM = 8
+
+// The largest key derivation rate: 2^24.
+pub const SRTP_KDR_MAX = 16777216
+
+// The longest master key identifier this package holds, in bytes: 8.
+pub const SRTP_MKI_MAX = 8
+
+// The state of one direction of one stream.
+pub @value
+struct SrtpCtx
+    // One of the profile numbers above, or 0 for a context not yet set up.
+    profile: Int
+    // The key derivation rate: 0, or a power of two up to 2^24.
+    kdr: Int
+    // The length of the master key identifier in the packets, 0 for none.
+    mki_len: Int
+    // The master key identifier, as a big-endian number.
+    mki: Int
+    // The master key, expanded for the key derivation function.
+    master: aes_core.AesKey
+    // The master salt.
+    msalt: srtpaes.SrtpBytes
+    // The value of `index DIV kdr` the SRTP session keys were derived for.
+    rtp_r: Int
+    // The SRTP session encryption key.
+    rtp_gk: srtpgcm.SrtpGcmKey
+    // The SRTP session authentication key; unused by the GCM profiles.
+    rtp_auth: srtpmac.SrtpAuthKey
+    // The SRTP session salt.
+    rtp_salt: srtpaes.SrtpBytes
+    // The value of `index DIV kdr` the SRTCP session keys were derived for.
+    rtcp_r: Int
+    // The SRTCP session encryption key.
+    rtcp_gk: srtpgcm.SrtpGcmKey
+    // The SRTCP session authentication key; unused by the GCM profiles.
+    rtcp_auth: srtpmac.SrtpAuthKey
+    // The SRTCP session salt.
+    rtcp_salt: srtpaes.SrtpBytes
+    // The highest SRTP index and the replay list.
+    rtp: srtpindex.SrtpWindow
+    // The highest SRTCP index received and the replay list.
+    rtcp: srtpindex.SrtpWindow
+    // The SRTCP index of the next packet this context sends.
+    rtcp_next: Int
+
+// Whether a number is one of the six profiles.
+pub @tier(embedded)
+@no_alloc
+fn profile_ok(p: Int) -> Bool []
+    p == SRTP_AES128_CM_SHA1_80 or p == SRTP_AES128_CM_SHA1_32 or p == SRTP_AES256_CM_SHA1_80
+        or p == SRTP_AES256_CM_SHA1_32 or p == SRTP_AEAD_AES128_GCM or p == SRTP_AEAD_AES256_GCM
+
+// The master key length of a profile, in bytes: 16 or 32.
+pub @tier(embedded)
+@no_alloc
+fn key_len(p: Int) -> Int []
+    if p == SRTP_AES256_CM_SHA1_80 or p == SRTP_AES256_CM_SHA1_32 or p == SRTP_AEAD_AES256_GCM
+        return 32
+    16
+
+// Whether a profile is one of the AES-GCM profiles.
+pub @tier(embedded)
+@no_alloc
+fn is_gcm(p: Int) -> Bool []
+    p == SRTP_AEAD_AES128_GCM or p == SRTP_AEAD_AES256_GCM
+
+// The master salt length of a profile, in bytes: 14, or 12 for AES-GCM.
+pub @tier(embedded)
+@no_alloc
+fn salt_len(p: Int) -> Int []
+    if is_gcm(p)
+        return srtpkdf.SRTP_SALT_GCM
+    srtpkdf.SRTP_SALT_CM
+
+// The authentication tag an SRTP packet ends with, in bytes: 10, 4, or 0 for
+// AES-GCM, whose 16-byte tag is part of the cipher.
+pub @tier(embedded)
+@no_alloc
+fn rtp_tag_len(p: Int) -> Int []
+    if is_gcm(p)
+        return 0
+    if p == SRTP_AES128_CM_SHA1_32 or p == SRTP_AES256_CM_SHA1_32
+        return 4
+    10
+
+// The authentication tag an SRTCP packet ends with, in bytes: 10, or 0 for
+// AES-GCM.
+pub @tier(embedded)
+@no_alloc
+fn rtcp_tag_len(p: Int) -> Int []
+    if is_gcm(p)
+        return 0
+    10
+
+// Whether a key derivation rate is allowed: 0, or a power of two from 1 to
+// 2^24 (RFC 3711 section 3.2.1).
+@tier(embedded)
+@no_alloc
+fn kdr_ok(kdr: Int) -> Bool []
+    kdr == 0 or kdr > 0 and kdr <= SRTP_KDR_MAX and (kdr & (kdr - 1)) == 0
+
+// A context with nothing set up.
+//
+// ```novo
+// use srtpctx
+//
+// fn main() [io]
+//     let c = srtpctx.empty()
+//     println("${c.profile}")   // 0
+// ```
+pub @tier(embedded)
+@no_alloc
+fn empty() -> SrtpCtx []
+    var z: srtpaes.SrtpBytes = Vec.new()
+    let k = srtpaes.expand(var z, 16)
+    let gk = srtpgcm.SrtpGcmKey { k: k, h: zero_gf() }
+    SrtpCtx { profile: 0, kdr: 0, mki_len: 0, mki: 0, master: k, msalt: Vec.new(), rtp_r: -1,
+              rtp_gk: gk, rtp_auth: Vec.new(), rtp_salt: Vec.new(), rtcp_r: -1, rtcp_gk: gk,
+              rtcp_auth: Vec.new(), rtcp_salt: Vec.new(), rtp: srtpindex.window_new(),
+              rtcp: srtpindex.window_new(), rtcp_next: 0 }
+
+// The zero element of GF(2^128).
+@tier(embedded)
+@no_alloc
+fn zero_gf() -> ghash_core.Gf128 []
+    ghash_core.Gf128 { hi: 0, lo: 0 }
+
+// Derive the session keys for SRTP or SRTCP at the quotient `r`.
+@tier(embedded)
+@no_alloc
+fn derive_session(var c: SrtpCtx, rtcp: Bool, r: Int) []
+    var base = 0
+    if rtcp
+        base = 3
+    let n = key_len(c.profile)
+    var raw: srtpaes.SrtpBytes = Vec.new()
+    srtpkdf.derive(c.master, var c.msalt, base + srtpkdf.SRTP_LABEL_RTP_ENC, r, n, var raw)
+    let gk = srtpgcm.key(var raw, n)
+    var auth: srtpmac.SrtpAuthKey = Vec.new()
+    if not is_gcm(c.profile)
+        srtpkdf.derive(c.master, var c.msalt, base + srtpkdf.SRTP_LABEL_RTP_AUTH, r,
+                       srtpmac.SRTP_AUTH_KEY_BYTES, var raw)
+        for i in 0..srtpmac.SRTP_AUTH_KEY_BYTES
+            let _ = auth.push(raw[i])
+    var salt: srtpaes.SrtpBytes = Vec.new()
+    srtpkdf.derive(c.master, var c.msalt, base + srtpkdf.SRTP_LABEL_RTP_SALT, r,
+                   salt_len(c.profile), var salt)
+    if rtcp
+        c.rtcp_r = r
+        c.rtcp_gk = gk
+        c.rtcp_auth = auth
+        c.rtcp_salt = salt
+    else
+        c.rtp_r = r
+        c.rtp_gk = gk
+        c.rtp_auth = auth
+        c.rtp_salt = salt
+
+// Make the session keys the ones for the packet with this index, deriving
+// them again when the key derivation rate says they changed.
+pub @tier(embedded)
+@no_alloc
+fn ensure_keys(var c: SrtpCtx, rtcp: Bool, index: Int) []
+    if c.kdr == 0
+        return
+    let r = index / c.kdr
+    if rtcp
+        if r != c.rtcp_r
+            derive_session(var c, true, r)
+    else if r != c.rtp_r
+        derive_session(var c, false, r)
+
+// Set up a context for a profile from the master key and the master salt.
+//
+// `kdr` is the key derivation rate: 0, or a power of two up to 2^24.  The
+// key must have the length the profile names and the salt the length the
+// profile names, 14 bytes or 12.  Answers `SRTP_OK`, or `SRTP_ERR_ARGUMENT`
+// with the context left empty.  The session keys for the first packet are
+// derived here.
+//
+// ```novo
+// use srtpaes
+// use srtpctx
+//
+// fn main() [io]
+//     var key: srtpaes.SrtpBytes = Vec.new()
+//     var salt: srtpaes.SrtpBytes = Vec.new()
+//     for i in 0..16
+//         let _ = key.push(i as u8)
+//     for i in 0..14
+//         let _ = salt.push((100 + i) as u8)
+//     var c = srtpctx.empty()
+//     let st = srtpctx.init(var c, srtpctx.SRTP_AES128_CM_SHA1_80, var key, var salt, 0)
+//     println("${st} ${c.profile}")   // 0 1
+// ```
+pub @tier(embedded)
+@no_alloc
+fn init(var c: SrtpCtx, profile: Int, var key: srtpaes.SrtpBytes, var salt: srtpaes.SrtpBytes,
+        kdr: Int) -> Int []
+    c = empty()
+    if not profile_ok(profile) or key.len() != key_len(profile)
+            or salt.len() != salt_len(profile) or not kdr_ok(kdr)
+        return SRTP_ERR_ARGUMENT
+    c.profile = profile
+    c.kdr = kdr
+    c.master = srtpaes.expand(var key, key.len())
+    for i in 0..salt.len()
+        let _ = c.msalt.push(salt[i])
+    derive_session(var c, false, 0)
+    derive_session(var c, true, 0)
+    SRTP_OK
+
+// Make the packets of this context carry a master key identifier of `len`
+// bytes with the value `value`, a big-endian number.  `len` is 0 through 8,
+// 0 meaning none; the value must be zero or more and fit in `len` bytes.
+// Answers `SRTP_OK` or `SRTP_ERR_ARGUMENT`.
+//
+// A receiver refuses a packet whose identifier is not this one, and a
+// context holds one master key, so a receiver with several master keys holds
+// one context for each and chooses by `srtp.packet_mki`.
+pub @tier(embedded)
+@no_alloc
+fn set_mki(var c: SrtpCtx, len: Int, value: Int) -> Int []
+    if len < 0 or len > SRTP_MKI_MAX or value < 0 or len < 8 and value >= (1 << (8 * len))
+        return SRTP_ERR_ARGUMENT
+    c.mki_len = len
+    c.mki = value
+    SRTP_OK
+
+// The SRTCP index the next packet of this context will carry.
+pub @tier(embedded)
+@no_alloc
+fn rtcp_index(c: SrtpCtx) -> Int []
+    c.rtcp_next
+
+// Set the SRTCP index of the next packet.
+//
+// RFC 3711 section 3.4 says the index is zero before the first packet is
+// sent and is not reset after a re-key, so a caller that builds a new
+// context for a new master key carries the index over with this.  An index
+// outside 0 through 2^31 - 1 is refused with `SRTP_ERR_ARGUMENT`.
+pub @tier(embedded)
+@no_alloc
+fn set_rtcp_index(var c: SrtpCtx, index: Int) -> Int []
+    if index < 0 or index > 2147483647
+        return SRTP_ERR_ARGUMENT
+    c.rtcp_next = index
+    SRTP_OK
+
+// The initialisation vector of the counter mode (RFC 3711 section 4.1.1):
+// `(salt * 2^16) XOR (SSRC * 2^64) XOR (index * 2^16)`, as the first counter
+// block.  The index is the 48-bit SRTP index or the SRTCP index.
+//
+// ```novo
+// use srtpaes
+// use srtpctx
+//
+// fn main() [io]
+//     var salt: srtpaes.SrtpBytes = Vec.new()
+//     for _i in 0..14
+//         let _ = salt.push(0 as u8)
+//     let b = srtpctx.iv_cm(var salt, 0x01020304, 0x0A0B0C0D0E0F)
+//     println("${srtpaes.block_byte(b, 4)} ${srtpaes.block_byte(b, 8)} ${srtpaes.block_byte(b, 13)}")   // 1 10 15
+// ```
+pub @tier(embedded)
+@no_alloc
+fn iv_cm(var salt: srtpaes.SrtpBytes, ssrc: Int, index: Int) -> aes_core.AesBlock []
+    var x: srtpaes.SrtpBytes = Vec.new()
+    for i in 0..16
+        if i < salt.len() and i < 14
+            let _ = x.push(salt[i])
+        else
+            let _ = x.push(0 as u8)
+    for i in 0..4
+        x[4 + i] = (x[4 + i] as Int ^ ((ssrc >>> (8 * (3 - i))) & 0xFF)) as u8
+    for i in 0..6
+        x[8 + i] = (x[8 + i] as Int ^ ((index >>> (8 * (5 - i))) & 0xFF)) as u8
+    srtpaes.block_at(var x, 0)
+
+// The 12-byte IV of AES-GCM (RFC 7714 sections 8.1 and 9.1): two zero bytes,
+// the SSRC, and the 48-bit index (for SRTCP, two zero bytes and the 32-bit
+// word with the E bit clear), XORed with the session salt.  Written to `out`,
+// replacing what it held.
+pub @tier(embedded)
+@no_alloc
+fn iv_gcm(var salt: srtpaes.SrtpBytes, ssrc: Int, index: Int, var out: srtpaes.SrtpBytes) []
+    out.clear()
+    for i in 0..12
+        var b = 0
+        if i >= 2 and i < 6
+            b = (ssrc >>> (8 * (5 - i))) & 0xFF
+        else if i >= 6
+            b = (index >>> (8 * (11 - i))) & 0xFF
+        if i < salt.len()
+            b = b ^ salt[i] as Int
+        let _ = out.push(b as u8)

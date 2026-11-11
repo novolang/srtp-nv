@@ -1,0 +1,118 @@
+// srtpdtls.nv — the keys of DTLS-SRTP, RFC 5764 section 4.2, taken from the
+// bytes the DTLS handshake exports.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it, and no allocation.
+// There is no DTLS here.  A DTLS endpoint that has negotiated the `use_srtp`
+// extension asks its TLS stack for keying material with the label
+// "EXTRACTOR-dtls_srtp" and an empty context, and the stack answers
+// `2 * (master_key_len + master_salt_len)` bytes (RFC 5705).  This module
+// takes those bytes and the profile the handshake agreed on and builds the
+// two contexts.
+//
+// THE LAYOUT of the exported bytes is
+//
+//     client_write_SRTP_master_key   [master_key_len]
+//     server_write_SRTP_master_key   [master_key_len]
+//     client_write_SRTP_master_salt  [master_salt_len]
+//     server_write_SRTP_master_salt  [master_salt_len]
+//
+// An endpoint protects what it sends with its own write keys and unprotects
+// what it receives with its peer's, so the client's sending context and the
+// server's receiving context come from the same key and salt, and the other
+// pair from the other.  The key derivation rate is zero (RFC 5764
+// section 4.1.2), and there is no master key identifier.
+//
+// `use_srtp` also carries a profile number.  The numbers are those of
+// `srtpctx`: 1 and 2 for the AES-128 counter-mode profiles, 7 and 8 for the
+// AES-GCM profiles of RFC 7714.  The NULL-cipher profiles 5 and 6 are not
+// supported.
+
+use srtpaes
+use srtpctx
+
+// The longest exported keying material this package reads: 92 bytes, the
+// 2 * (32 + 14) of an AES-256 profile.
+pub const SRTP_EXPORTER_MAX = 96
+
+// The bytes of keying material a DTLS handshake exports.
+pub alias SrtpExporter = Vec[u8; 96]
+
+// How many bytes the exporter must be asked for under a profile:
+// `2 * (master_key_len + master_salt_len)`, or 0 for a number that is not a
+// profile.
+//
+// ```novo
+// use srtpctx
+// use srtpdtls
+//
+// fn main() [io]
+//     println("${srtpdtls.exporter_len(srtpctx.SRTP_AES128_CM_SHA1_80)}")   // 60
+// ```
+pub @tier(embedded)
+@no_alloc
+fn exporter_len(profile: Int) -> Int []
+    if not srtpctx.profile_ok(profile)
+        return 0
+    2 * (srtpctx.key_len(profile) + srtpctx.salt_len(profile))
+
+// Copy `n` bytes of the exporter from index `off`.
+@tier(embedded)
+@no_alloc
+fn slice_of(var e: SrtpExporter, off: Int, n: Int) -> srtpaes.SrtpBytes []
+    var out: srtpaes.SrtpBytes = Vec.new()
+    for i in 0..n
+        let _ = out.push(e[off + i])
+    out
+
+// Set up a context for the keys of one side: the key at index `kidx` of the
+// two keys and the salt at index `kidx` of the two salts.
+@tier(embedded)
+@no_alloc
+fn side(var c: srtpctx.SrtpCtx, profile: Int, var e: SrtpExporter, kidx: Int) -> Int []
+    let kl = srtpctx.key_len(profile)
+    let sl = srtpctx.salt_len(profile)
+    var key = slice_of(var e, kidx * kl, kl)
+    var salt = slice_of(var e, 2 * kl + kidx * sl, sl)
+    srtpctx.init(var c, profile, var key, var salt, 0)
+
+// Set up the sending and the receiving context from the exported bytes.
+//
+// `is_client` is true for the endpoint that sent the ClientHello.  `send`
+// protects what this endpoint sends and `receive` unprotects what it
+// receives.  The exporter must hold exactly `exporter_len(profile)` bytes.
+// Answers `SRTP_OK`, or `SRTP_ERR_ARGUMENT` for an unknown profile or an
+// exporter of another length, with the contexts left empty.
+//
+// The RTCP of a session goes through the same two contexts: the SRTP and
+// SRTCP keys of one side are both derived from its master key (RFC 5764
+// section 4.2).
+//
+// ```novo
+// use srtpctx
+// use srtpdtls
+//
+// fn main() [io]
+//     var e: srtpdtls.SrtpExporter = Vec.new()
+//     for i in 0..60
+//         let _ = e.push(i as u8)
+//     var tx = srtpctx.empty()
+//     var rx = srtpctx.empty()
+//     let st = srtpdtls.contexts(srtpctx.SRTP_AES128_CM_SHA1_80, var e, true, var tx, var rx)
+//     println("${st} ${tx.profile} ${rx.profile}")   // 0 1 1
+// ```
+pub @tier(embedded)
+@no_alloc
+fn contexts(profile: Int, var e: SrtpExporter, is_client: Bool, var send: srtpctx.SrtpCtx,
+            var receive: srtpctx.SrtpCtx) -> Int []
+    send = srtpctx.empty()
+    receive = srtpctx.empty()
+    if exporter_len(profile) == 0 or e.len() != exporter_len(profile)
+        return srtpctx.SRTP_ERR_ARGUMENT
+    var mine = 1
+    var theirs = 0
+    if is_client
+        mine = 0
+        theirs = 1
+    // The length and the profile were checked above, so neither call refuses.
+    let _ = side(var send, profile, var e, mine)
+    side(var receive, profile, var e, theirs)

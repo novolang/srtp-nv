@@ -1,0 +1,530 @@
+// srtpsdes.nv — the SDES crypto attribute of RFC 4568, read and written.
+//
+// `@tier(embedded)` on all of it and no allocation.  SDP Security
+// Descriptions carry the master key of an SRTP session in the session
+// description itself, as an attribute
+//
+//     a=crypto:<tag> <crypto-suite> inline:<key||salt>[|<lifetime>][|<MKI>:<length>] [<session-param> ...]
+//
+// where the key and the salt are concatenated and base64 encoded (RFC 4568
+// section 6.1).  This module reads the value of such an attribute, the text
+// after `a=crypto:`, into a `SdesCrypto`, and writes one back into a buffer.
+// The SDP itself is the business of an SDP package: pass it `a.value` of the
+// attribute and the text this module writes.
+//
+// THE SUITES are the names of RFC 4568 section 6.2, RFC 6188 and RFC 7714:
+// AES_CM_128_HMAC_SHA1_80, AES_CM_128_HMAC_SHA1_32, AES_256_CM_HMAC_SHA1_80,
+// AES_256_CM_HMAC_SHA1_32, AEAD_AES_128_GCM and AEAD_AES_256_GCM.  The f8
+// suites are NOT IMPLEMENTED and read as `SDES_ERR_SUITE`.
+//
+// THE LIFETIME is a decimal number or `2^n` and is at most 2^48.  The MKI is
+// a decimal number and a length in bytes; this package holds an identifier
+// of up to 8 bytes.  The session parameters read are `KDR=n` (the key
+// derivation rate is 2^n, n from 1 to 24), `WSH=n` (a hint of the replay
+// window, at least 64) and the three flags `UNENCRYPTED_SRTP`,
+// `UNENCRYPTED_SRTCP` and `UNAUTHENTICATED_SRTP`.  Several keys in one
+// attribute, separated by `;`, `FEC_ORDER`, `FEC_KEY` and the extension
+// parameters are refused as `SDES_ERR_PARAM`.
+
+use srtpaes
+use srtpctx
+
+// The attribute was read.
+pub const SDES_OK = 0
+// The text does not follow the grammar of RFC 4568 section 9.2.
+pub const SDES_ERR_SYNTAX = 1
+// The crypto suite is not one of the six this package implements.
+pub const SDES_ERR_SUITE = 2
+// The key is not base64, or its length is not the suite's.
+pub const SDES_ERR_KEY = 3
+// A parameter is out of range or one this package does not implement.
+pub const SDES_ERR_PARAM = 4
+
+// The text of an attribute value, in a buffer the caller owns.
+pub alias SdesText = Vec[u8; 192]
+
+// The key and salt, concatenated: 46 bytes at most.
+pub alias SdesKeyMaterial = Vec[u8; 48]
+
+// What an attribute holds.
+pub @value
+struct SdesCrypto
+    // `SDES_OK` or the fault; no other field means anything after a fault.
+    status: Int
+    // The tag, 1 through 999999999, that names the attribute in an answer.
+    tag: Int
+    // The profile, one of the `srtpctx` numbers.
+    profile: Int
+    // The master key.
+    key: srtpaes.SrtpBytes
+    // The master salt.
+    salt: srtpaes.SrtpBytes
+    // The key lifetime in packets, 0 when the attribute names none.
+    lifetime: Int
+    // The master key identifier, 0 when `mki_len` is 0.
+    mki: Int
+    // The length of the master key identifier in bytes, 0 for none.
+    mki_len: Int
+    // The exponent of the key derivation rate, 1 through 24, 0 for none.
+    kdr_exp: Int
+    // The window size hint, 0 for none.
+    wsh: Int
+    // Whether the session parameter UNENCRYPTED_SRTP is present.
+    unencrypted_srtp: Bool
+    // Whether the session parameter UNENCRYPTED_SRTCP is present.
+    unencrypted_srtcp: Bool
+    // Whether the session parameter UNAUTHENTICATED_SRTP is present.
+    unauthenticated_srtp: Bool
+
+// The largest lifetime a key may name: 2^48.
+pub const SDES_LIFETIME_MAX = 281474976710656
+
+// An attribute that failed with `status`.
+@tier(embedded)
+@no_alloc
+fn failed(status: Int) -> SdesCrypto []
+    SdesCrypto { status: status, tag: 0, profile: 0, key: Vec.new(), salt: Vec.new(),
+                 lifetime: 0, mki: 0, mki_len: 0, kdr_exp: 0, wsh: 0, unencrypted_srtp: false,
+                 unencrypted_srtcp: false, unauthenticated_srtp: false }
+
+// The name of a crypto suite, or "" for a number that is not a profile.
+//
+// ```novo
+// use srtpctx
+// use srtpsdes
+//
+// fn main() [io]
+//     println(srtpsdes.suite_name(srtpctx.SRTP_AEAD_AES128_GCM))   // AEAD_AES_128_GCM
+// ```
+pub @tier(embedded)
+@no_alloc
+fn suite_name(profile: Int) -> Str []
+    if profile == srtpctx.SRTP_AES128_CM_SHA1_80
+        return "AES_CM_128_HMAC_SHA1_80"
+    if profile == srtpctx.SRTP_AES128_CM_SHA1_32
+        return "AES_CM_128_HMAC_SHA1_32"
+    if profile == srtpctx.SRTP_AES256_CM_SHA1_80
+        return "AES_256_CM_HMAC_SHA1_80"
+    if profile == srtpctx.SRTP_AES256_CM_SHA1_32
+        return "AES_256_CM_HMAC_SHA1_32"
+    if profile == srtpctx.SRTP_AEAD_AES128_GCM
+        return "AEAD_AES_128_GCM"
+    if profile == srtpctx.SRTP_AEAD_AES256_GCM
+        return "AEAD_AES_256_GCM"
+    ""
+
+// Whether the bytes `[a, b)` of `s` spell `lit`.
+@tier(embedded)
+@no_alloc
+fn spells(s: Str, a: Int, b: Int, lit: Str) -> Bool []
+    if b - a != str.len(lit)
+        return false
+    for i in 0..str.len(lit)
+        if str.byte_at_or(s, a + i, -1) != str.byte_at_or(lit, i, -2)
+            return false
+    true
+
+// The profile a suite name names, or 0.
+@tier(embedded)
+@no_alloc
+fn suite_of(s: Str, a: Int, b: Int) -> Int []
+    for p in 1..9
+        if srtpctx.profile_ok(p) and spells(s, a, b, suite_name(p))
+            return p
+    0
+
+// The index of the first byte of `s` from `a` that is `ch`, or the length
+// of `s` when there is none.
+@tier(embedded)
+@no_alloc
+fn find_byte(s: Str, a: Int, ch: Int) -> Int []
+    let n = str.len(s)
+    for i in a..n
+        if str.byte_at_or(s, i, -1) == ch
+            return i
+    n
+
+// The index of the first byte at or after `a` that is `ch` and below `end`,
+// or `end`.
+@tier(embedded)
+@no_alloc
+fn find_before(s: Str, a: Int, end: Int, ch: Int) -> Int []
+    for i in a..end
+        if str.byte_at_or(s, i, -1) == ch
+            return i
+    end
+
+// The decimal number in `[a, b)`, or -1 when the range is empty, has a
+// character that is not a digit, has a leading zero, or has more than 18
+// digits.
+@tier(embedded)
+@no_alloc
+fn number(s: Str, a: Int, b: Int) -> Int []
+    if b <= a or b - a > 18
+        return -1
+    if b - a > 1 and str.byte_at_or(s, a, 0) == 48
+        return -1
+    var v = 0
+    for i in a..b
+        let d = str.byte_at_or(s, i, 0) - 48
+        if d < 0 or d > 9
+            return -1
+        v = v * 10 + d
+    v
+
+// The value of a base64 character, or -1.
+@tier(embedded)
+@no_alloc
+fn b64_value(c: Int) -> Int []
+    if c >= 65 and c <= 90
+        return c - 65
+    if c >= 97 and c <= 122
+        return c - 71
+    if c >= 48 and c <= 57
+        return c + 4
+    if c == 43
+        return 62
+    if c == 47
+        return 63
+    -1
+
+// The base64 character of a 6-bit value.
+@tier(embedded)
+@no_alloc
+fn b64_char(v: Int) -> Int []
+    if v < 26
+        return 65 + v
+    if v < 52
+        return 71 + v
+    if v < 62
+        return v - 4
+    if v == 62
+        return 43
+    47
+
+// Decode the base64 in `[a, b)` into `out`, discarding the `=` that end it,
+// and answer the number of bytes, or -1 for a character that is not base64
+// or a length no encoder writes.
+@tier(embedded)
+@no_alloc
+fn b64_decode(s: Str, a: Int, b: Int, var out: SdesKeyMaterial) -> Int []
+    out.clear()
+    var end = b
+    for _i in 0..2
+        if end > a and str.byte_at_or(s, end - 1, 0) == 61
+            end = end - 1
+    if (end - a) % 4 == 1
+        return -1
+    var acc = 0
+    var have = 0
+    for i in a..end
+        let v = b64_value(str.byte_at_or(s, i, 0))
+        if v < 0 or out.len() >= 48
+            return -1
+        acc = ((acc << 6) | v) & 0xFFFFFF
+        have = have + 6
+        if have >= 8
+            have = have - 8
+            let _ = out.push(((acc >> have) & 0xFF) as u8)
+    out.len()
+
+// Read the value of an `a=crypto:` attribute.
+//
+// The text is the part after the colon: the tag, the suite, the key
+// parameters and the session parameters, separated by single spaces.
+// `status` of the answer is `SDES_OK` or the first fault: `SDES_ERR_SYNTAX`
+// for text that is not an attribute, `SDES_ERR_SUITE`, `SDES_ERR_KEY` or
+// `SDES_ERR_PARAM`.
+//
+// This is the example of RFC 4568 section 6.1:
+//
+// ```novo
+// use srtpsdes
+//
+// fn main() [io]
+//     let c = srtpsdes.parse("1 AES_CM_128_HMAC_SHA1_80 inline:d0RmdmcmVCspeEc3QGZiNWpVLFJhQX1cfHAwJSoj|2^20|1:4")
+//     println("${c.status} ${c.tag} ${c.profile} ${c.lifetime} ${c.mki} ${c.mki_len}")   // 0 1 1 1048576 1 4
+// ```
+pub @tier(embedded)
+@no_alloc
+fn parse(s: Str) -> SdesCrypto []
+    let n = str.len(s)
+    let tag_end = find_byte(s, 0, 32)
+    let tag = number(s, 0, tag_end)
+    if tag < 1 or tag_end >= n or tag_end > 9
+        return failed(SDES_ERR_SYNTAX)
+    let suite_end = find_byte(s, tag_end + 1, 32)
+    if suite_end >= n
+        return failed(SDES_ERR_SYNTAX)
+    let profile = suite_of(s, tag_end + 1, suite_end)
+    if profile == 0
+        return failed(SDES_ERR_SUITE)
+    let key_end = find_byte(s, suite_end + 1, 32)
+    if not spells(s, suite_end + 1, suite_end + 8, "inline:")
+        return failed(SDES_ERR_SYNTAX)
+    let c = key_params(s, suite_end + 8, key_end, tag, profile)
+    if c.status != SDES_OK or key_end >= n
+        return c
+    session_params(s, key_end + 1, c)
+
+// The key material, the lifetime and the master key identifier in
+// `[a, end)`, the text after `inline:`.
+@tier(embedded)
+@no_alloc
+fn key_params(s: Str, a: Int, end: Int, tag: Int, profile: Int) -> SdesCrypto []
+    if find_before(s, a, end, 59) < end
+        return failed(SDES_ERR_PARAM)
+    let bar = find_before(s, a, end, 124)
+    var km: SdesKeyMaterial = Vec.new()
+    let got = b64_decode(s, a, bar, var km)
+    let kl = srtpctx.key_len(profile)
+    let sl = srtpctx.salt_len(profile)
+    if got != kl + sl
+        return failed(SDES_ERR_KEY)
+    var key: srtpaes.SrtpBytes = Vec.new()
+    var salt: srtpaes.SrtpBytes = Vec.new()
+    for i in 0..kl
+        let _ = key.push(km[i])
+    for i in 0..sl
+        let _ = salt.push(km[kl + i])
+    var c = SdesCrypto { status: SDES_OK, tag: tag, profile: profile, key: key, salt: salt,
+                         lifetime: 0, mki: 0, mki_len: 0, kdr_exp: 0, wsh: 0,
+                         unencrypted_srtp: false, unencrypted_srtcp: false,
+                         unauthenticated_srtp: false }
+    var at = bar
+    for _i in 0..2
+        if at < end and c.status == SDES_OK
+            at = key_extra(s, at + 1, end, var c)
+    if at < end and c.status == SDES_OK
+        return failed(SDES_ERR_SYNTAX)
+    c
+
+// Read one `|` field of the key parameters from `a`, a lifetime or an MKI,
+// into `c`, and answer the index of the next `|` or `end`.
+@tier(embedded)
+@no_alloc
+fn key_extra(s: Str, a: Int, end: Int, var c: SdesCrypto) -> Int []
+    let next = find_before(s, a, end, 124)
+    let colon = find_before(s, a, next, 58)
+    if colon < next
+        read_mki(s, a, colon, next, var c)
+    else
+        read_lifetime(s, a, next, var c)
+    next
+
+// The lifetime in `[a, b)`: a decimal number or `2^n`.
+@tier(embedded)
+@no_alloc
+fn read_lifetime(s: Str, a: Int, b: Int, var c: SdesCrypto) []
+    if c.lifetime != 0 or c.mki_len != 0
+        c = failed(SDES_ERR_SYNTAX)
+        return
+    var v = -1
+    if spells(s, a, a + 2, "2^")
+        let e = number(s, a + 2, b)
+        if e >= 0 and e <= 48
+            v = 1 << e
+    else
+        v = number(s, a, b)
+    if v < 1 or v > SDES_LIFETIME_MAX
+        c = failed(SDES_ERR_SYNTAX)
+        return
+    c = SdesCrypto { status: SDES_OK, tag: c.tag, profile: c.profile, key: c.key, salt: c.salt,
+                     lifetime: v, mki: 0, mki_len: 0, kdr_exp: 0, wsh: 0,
+                     unencrypted_srtp: false, unencrypted_srtcp: false,
+                     unauthenticated_srtp: false }
+
+// The master key identifier `[a, colon)` and its length `(colon, b)`.
+@tier(embedded)
+@no_alloc
+fn read_mki(s: Str, a: Int, colon: Int, b: Int, var c: SdesCrypto) []
+    let value = number(s, a, colon)
+    let len = number(s, colon + 1, b)
+    if c.mki_len != 0 or value < 0 or len < 1 or len > 128
+        c = failed(SDES_ERR_SYNTAX)
+        return
+    if len > srtpctx.SRTP_MKI_MAX or len < 8 and value >= (1 << (8 * len))
+        c = failed(SDES_ERR_PARAM)
+        return
+    c = SdesCrypto { status: SDES_OK, tag: c.tag, profile: c.profile, key: c.key, salt: c.salt,
+                     lifetime: c.lifetime, mki: value, mki_len: len, kdr_exp: 0, wsh: 0,
+                     unencrypted_srtp: false, unencrypted_srtcp: false,
+                     unauthenticated_srtp: false }
+
+// Read the session parameters in `s` from `a`, separated by single spaces,
+// into a copy of `c`.
+@tier(embedded)
+@no_alloc
+fn session_params(s: Str, a: Int, c: SdesCrypto) -> SdesCrypto []
+    var kdr = 0
+    var wsh = 0
+    var un_srtp = false
+    var un_srtcp = false
+    var un_auth = false
+    var at = a
+    let n = str.len(s)
+    for _i in 0..n
+        if at < n
+            let e = find_byte(s, at, 32)
+            if spells(s, at, e, "UNENCRYPTED_SRTP")
+                un_srtp = true
+            else if spells(s, at, e, "UNENCRYPTED_SRTCP")
+                un_srtcp = true
+            else if spells(s, at, e, "UNAUTHENTICATED_SRTP")
+                un_auth = true
+            else if spells(s, at, at + 4, "KDR=")
+                kdr = number(s, at + 4, e)
+                if kdr < 1 or kdr > 24
+                    return failed(SDES_ERR_PARAM)
+            else if spells(s, at, at + 4, "WSH=")
+                wsh = number(s, at + 4, e)
+                if wsh < 64
+                    return failed(SDES_ERR_PARAM)
+            else
+                return failed(SDES_ERR_PARAM)
+            at = e + 1
+    SdesCrypto { status: SDES_OK, tag: c.tag, profile: c.profile, key: c.key, salt: c.salt,
+                 lifetime: c.lifetime, mki: c.mki, mki_len: c.mki_len, kdr_exp: kdr, wsh: wsh,
+                 unencrypted_srtp: un_srtp, unencrypted_srtcp: un_srtcp,
+                 unauthenticated_srtp: un_auth }
+
+// Append one byte.  Answers false when the buffer is full.
+@tier(embedded)
+@no_alloc
+fn put_byte(var out: SdesText, b: Int) -> Bool []
+    match out.push((b & 0xFF) as u8)
+        Ok(_)  => true
+        Err(_) => false
+
+// Append the bytes of a string to a buffer.
+@tier(embedded)
+@no_alloc
+fn put_str(var out: SdesText, s: Str) -> Bool []
+    var ok = true
+    for i in 0..str.len(s)
+        ok = ok and put_byte(var out, str.byte_at_or(s, i, 0))
+    ok
+
+// Append a non-negative number in decimal.
+@tier(embedded)
+@no_alloc
+fn put_int(var out: SdesText, v: Int) -> Bool []
+    var digits = 1
+    var p = 10
+    for _i in 0..17
+        if v >= p
+            digits = digits + 1
+            p = p * 10
+    var ok = true
+    for i in 0..digits
+        var d = v
+        for _k in 0..digits - 1 - i
+            d = d / 10
+        ok = ok and put_byte(var out, 48 + d % 10)
+    ok
+
+// Append the base64 of the key and the salt, with the `=` padding.
+@tier(embedded)
+@no_alloc
+fn put_b64(var out: SdesText, var km: SdesKeyMaterial) -> Bool []
+    var ok = true
+    let n = km.len()
+    for g in 0..(n + 2) / 3
+        var w = 0
+        for k in 0..3
+            var b = 0
+            if 3 * g + k < n
+                b = km[3 * g + k] as Int
+            w = (w << 8) | b
+        var chars = 4
+        if n - 3 * g < 3
+            chars = n - 3 * g + 1
+        for k in 0..4
+            if k < chars
+                ok = ok and put_byte(var out, b64_char((w >> (18 - 6 * k)) & 63))
+            else
+                ok = ok and put_byte(var out, 61)
+    ok
+
+// Write the value of an `a=crypto:` attribute into `out`, replacing what it
+// held: the tag, the suite name, `inline:` and the key, then the lifetime
+// as `2^n` when it is a power of two and as a decimal number when it is not,
+// the master key identifier, and the session parameters.
+//
+// Answers false, with `out` holding what was written so far, when `c` is
+// not a readable attribute (a fault status, an unknown profile, a key of the
+// wrong length) or the text does not fit in 192 bytes.
+//
+// ```novo
+// use srtpsdes
+//
+// fn main() [io]
+//     let c = srtpsdes.parse("1 AES_CM_128_HMAC_SHA1_80 inline:d0RmdmcmVCspeEc3QGZiNWpVLFJhQX1cfHAwJSoj|2^20|1:4")
+//     var t: srtpsdes.SdesText = Vec.new()
+//     let ok = srtpsdes.write(c, var t)
+//     println("${ok} ${t.len()}")   // true 85
+// ```
+pub @tier(embedded)
+@no_alloc
+fn write(c: SdesCrypto, var out: SdesText) -> Bool []
+    out.clear()
+    let name = suite_name(c.profile)
+    if c.status != SDES_OK or str.len(name) == 0 or c.key.len() != srtpctx.key_len(c.profile)
+            or c.salt.len() != srtpctx.salt_len(c.profile) or c.tag < 1
+        return false
+    var km: SdesKeyMaterial = Vec.new()
+    for i in 0..c.key.len()
+        let _ = km.push(c.key[i])
+    for i in 0..c.salt.len()
+        let _ = km.push(c.salt[i])
+    var ok = put_int(var out, c.tag)
+    ok = ok and put_str(var out, " ") and put_str(var out, name) and put_str(var out, " inline:")
+    ok = ok and put_b64(var out, var km)
+    if c.lifetime > 0
+        ok = ok and put_str(var out, "|")
+        ok = ok and put_lifetime(var out, c.lifetime)
+    if c.mki_len > 0
+        ok = ok and put_str(var out, "|") and put_int(var out, c.mki) and put_str(var out, ":")
+        ok = ok and put_int(var out, c.mki_len)
+    if c.kdr_exp > 0
+        ok = ok and put_str(var out, " KDR=") and put_int(var out, c.kdr_exp)
+    if c.wsh > 0
+        ok = ok and put_str(var out, " WSH=") and put_int(var out, c.wsh)
+    if c.unencrypted_srtp
+        ok = ok and put_str(var out, " UNENCRYPTED_SRTP")
+    if c.unencrypted_srtcp
+        ok = ok and put_str(var out, " UNENCRYPTED_SRTCP")
+    if c.unauthenticated_srtp
+        ok = ok and put_str(var out, " UNAUTHENTICATED_SRTP")
+    ok
+
+// Append a lifetime: `2^n` for a power of two, else the decimal number.
+@tier(embedded)
+@no_alloc
+fn put_lifetime(var out: SdesText, v: Int) -> Bool []
+    for e in 0..49
+        if v == (1 << e)
+            return put_str(var out, "2^") and put_int(var out, e)
+    put_int(var out, v)
+
+// Set up `c` from a parsed attribute: the profile, the key and the salt, the
+// key derivation rate and the master key identifier.
+//
+// Answers `SRTP_OK`, or `SRTP_ERR_ARGUMENT` for an attribute that has a
+// fault status or asks for SRTP without encryption or without
+// authentication, which this package does not implement.  The window size
+// hint is not used: the replay window is 64.
+pub @tier(embedded)
+@no_alloc
+fn init_ctx(var ctx: srtpctx.SrtpCtx, a: SdesCrypto) -> Int []
+    if a.status != SDES_OK or a.unencrypted_srtp or a.unencrypted_srtcp or a.unauthenticated_srtp
+        return srtpctx.SRTP_ERR_ARGUMENT
+    var key = a.key
+    var salt = a.salt
+    var kdr = 0
+    if a.kdr_exp > 0
+        kdr = 1 << a.kdr_exp
+    let st = srtpctx.init(var ctx, a.profile, var key, var salt, kdr)
+    if st != srtpctx.SRTP_OK
+        return st
+    srtpctx.set_mki(var ctx, a.mki_len, a.mki)

@@ -1,0 +1,116 @@
+// srtpaes.nv — AES in counter mode over a packet buffer, for SRTP and for
+// the key derivation function.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.  The block cipher is
+// the one of crypto-nv, which has no lookup table; what is here is the
+// counter mode of RFC 3711 section 4.1.1 and the loading of a key from the
+// bytes a key manager hands over.
+//
+// THE COUNTER MODE.  The keystream is the encryption of a 128-bit
+// counter block, then of the block plus one, and so on, XORed with the data.
+// SRTP forms the first block as
+//
+//     IV = (salt * 2^16) XOR (SSRC * 2^64) XOR (index * 2^16)
+//
+// so the low 16 bits of the first block are zero and the keystream block
+// numbered `j` is the IV with `j` in those bits, taken as a big-endian
+// number.  A packet is at most 2^16 blocks, which is a megabyte, and a
+// buffer here holds 1500 bytes, so the counter field never carries.
+//
+// A BLOCK is held as crypto-nv holds it: two `Int` words, byte 0 of the
+// block in the lowest lane of `lo` and byte 8 in the lowest lane of `hi`.
+// The two bytes of the counter, bytes 14 and 15 of the block, are the two
+// highest lanes of `hi`.
+
+use aes_core
+use rtpbytes
+
+// The longest session or master key: 32 bytes, an AES-256 key.
+pub const SRTP_KEY_MAX = 32
+
+// A key, a salt or an exporter fragment held as bytes.
+pub alias SrtpBytes = Vec[u8; 32]
+
+// Eight bytes of `b` from index `off`, the first byte lowest, as one
+// integer.  A byte past the end of the buffer reads as zero.
+@tier(embedded)
+@no_alloc
+fn le64(var b: SrtpBytes, off: Int) -> Int []
+    var v = 0
+    for i in 0..8
+        if off + i < b.len()
+            v = v | (b[off + i] as Int << (8 * i))
+    v
+
+// The expanded form of an AES key of 16 or 32 bytes.
+//
+// A key of any other length expands as a 128-bit key from its first 16
+// bytes, with missing bytes zero, so the answer always has a schedule; the
+// callers in this package check the length first.
+//
+// ```novo
+// use srtpaes
+//
+// fn main() [io]
+//     var k: srtpaes.SrtpBytes = Vec.new()
+//     for i in 0..16
+//         let _ = k.push(i as u8)
+//     let key = srtpaes.expand(var k, 16)
+//     println("${key.rounds}")   // 10
+// ```
+pub @tier(embedded)
+@no_alloc
+fn expand(var k: SrtpBytes, n: Int) -> aes_core.AesKey []
+    if n == 32
+        return aes_core.expand_key_256(le64(var k, 0), le64(var k, 8), le64(var k, 16), le64(var k, 24))
+    aes_core.expand_key_128(le64(var k, 0), le64(var k, 8))
+
+// The block that 16 bytes of a buffer make, from index `off`.
+@tier(embedded)
+@no_alloc
+fn block_at(var b: SrtpBytes, off: Int) -> aes_core.AesBlock []
+    aes_core.AesBlock { lo: le64(var b, off), hi: le64(var b, off + 8) }
+
+// The block `j` places after `iv` in counter mode: the two bytes of the
+// counter field, which hold zero in `iv`, are set to `j` big-endian.
+@tier(embedded)
+@no_alloc
+fn counter_block(iv: aes_core.AesBlock, j: Int) -> aes_core.AesBlock []
+    aes_core.AesBlock { lo: iv.lo, hi: iv.hi | (((j >> 8) & 0xFF) << 48) | ((j & 0xFF) << 56) }
+
+// Byte `i` of a block, 0 through 15.
+@tier(embedded)
+@no_alloc
+fn block_byte(b: aes_core.AesBlock, i: Int) -> Int []
+    if i < 8
+        return (b.lo >>> (8 * i)) & 0xFF
+    (b.hi >>> (8 * (i - 8))) & 0xFF
+
+// XOR `n` bytes of a packet from index `off` with the keystream that starts
+// at the counter block `iv`.
+//
+// The same call encrypts and decrypts.  A range that is not inside the
+// packet changes only the bytes that are.
+pub @tier(embedded)
+@no_alloc
+fn ctr_xor(k: aes_core.AesKey, iv: aes_core.AesBlock, var pkt: rtpbytes.RtpBuf, off: Int, n: Int) []
+    let blocks = (n + 15) / 16
+    for j in 0..blocks
+        let ks = aes_core.encrypt_block(k, counter_block(iv, j))
+        for i in 0..16
+            let at = off + 16 * j + i
+            if 16 * j + i < n and at >= 0 and at < pkt.len()
+                pkt[at] = (pkt[at] as Int ^ block_byte(ks, i)) as u8
+
+// Write `n` bytes of the keystream that starts at `iv` to `out`, replacing
+// what it held.  `n` is at most 32, a key's length.
+pub @tier(embedded)
+@no_alloc
+fn keystream(k: aes_core.AesKey, iv: aes_core.AesBlock, n: Int, var out: SrtpBytes) []
+    out.clear()
+    let blocks = (n + 15) / 16
+    for j in 0..blocks
+        let ks = aes_core.encrypt_block(k, counter_block(iv, j))
+        for i in 0..16
+            if 16 * j + i < n
+                let _ = out.push(block_byte(ks, i) as u8)
